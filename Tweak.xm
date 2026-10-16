@@ -593,9 +593,6 @@ static void InstallCryptoHooks(void) {
         { OFF_recvfrom,      (void *)my_recvfrom,(void **)&gRecvfrom, "recvfrom" },
         { OFF_write,         (void *)my_write,   (void **)&gWrite,    "write" },
         { OFF_read,          (void *)my_read,    (void **)&gRead,     "read" },
-        { OFF_socket,        (void *)my_socket,  (void **)&gSocket,   "socket" },
-        { OFF_connect,       (void *)my_connect, (void **)&gConnect,  "connect" },
-        { OFF_close,         (void *)my_close,   (void **)&gClose,    "close" },
     };
     int n = (int)(sizeof(T) / sizeof(T[0]));
     for (int i = 0; i < n; i++) {
@@ -770,14 +767,8 @@ static void MarkDone(NSString *theme) {
 static id FindReceiptTarget(void) {
     SEL sel = @selector(fetchAndSaveReceiptForTheme:);
     if (gCfg && [gCfg respondsToSelector:sel]) return gCfg;
-    for (NSString *cn in PluginClasses()) {
-        Class c = objc_getClass(cn.UTF8String);
-        if (!c) continue;
-        if (!class_getInstanceMethod(c, sel)) continue;
-        id inst = nil;
-        @try { inst = [[c alloc] init]; } @catch (NSException *e) { }
-        if (inst) { LogLine(@"收据目标类: %@", cn); return inst; }
-    }
+    // 不再 [[c alloc] init] —— 那会崩（插件对象必须由插件自己初始化）
+    LogLine(@"收据目标：gCfg 还没就位（请先打开一次主题商店，让插件创建对象）");
     return nil;
 }
 
@@ -1456,8 +1447,7 @@ static void InstallAll(int round) {
     @autoreleasepool {
         LogLine(@"socket 计数: send=%ld sendto=%ld recv=%ld recvfrom=%ld write=%ld read=%ld HTTP=%ld CONN=%ld RAW=%d 密钥=%d",
                 gNsend, gNsendto, gNrecv, gNrecvfrom, gNwrite, gNread, gNhttp, gNconn, gRawBytes, gKeysFound);
-        @try { if (round == 1) { InstallNetworkLogger(); InstallFileHooks(); } } @catch (NSException *e) { }
-        @try { InstallEnvelopeHooks(); } @catch (NSException *e) { }
+        @try { if (round == 1) InstallNetworkLogger(); } @catch (NSException *e) { }
         @try { InstallCryptoHooks(); } @catch (NSException *e) { }
         @try { int n = InstallLoader(); if (n) LogLine(@"第 %d 轮：loader 挂钩 %d 个", round, n); }
         @catch (NSException *e) { }
@@ -1472,13 +1462,13 @@ static void InitDump(void) {
         (void)Dir();
         // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
         LogLine(@"############################################################");
-        LogLine(@"##########  DumpKeiem v22  BUILD-C2  2026-10-16  ###########");
+        LogLine(@"##########  DumpKeiem v24  BUILD-C3  2026-10-16  ###########");
         LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
         LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
         // 额外写一份版本标记到稳定位置，方便确认
         @try {
-            NSString *tag = @"DumpKeiem v22 BUILD-C2\n";
+            NSString *tag = @"DumpKeiem v24 BUILD-C3\n";
             for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
                                   [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
                 [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
