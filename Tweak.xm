@@ -236,8 +236,19 @@ static void InstallCryptoHooks(void) {
         else if (i == 1) real = (void *)gCCHmac;
         else real = (void *)gPBKDF2;
         if (!real) { LogLine(@"   !! dlsym %s 失败，跳过", T[i].name); continue; }
+        // ★ 自校验：槽里的值必须「像未解析的 stub-helper（落在插件镜像内）」
+        //   或「等于 dlsym 拿到的真函数」。两者都不是 → 偏移不对，绝不写，防止挂错函数导致崩溃。
+        uintptr_t cu = (uintptr_t)cur, bu = (uintptr_t)base, ru = (uintptr_t)real;
+        BOOL inImage = (cu >= bu && cu < bu + 0x8000000UL);
+        BOOL isReal  = (cu == ru);
+        if (!inImage && !isReal) {
+            LogLine(@"   !! %s 槽值 %p 不像 stub-helper 也不像真函数(%p)，偏移可能不对，跳过",
+                    T[i].name, cur, real);
+            continue;
+        }
         if (SafeWriteSlot(slot, T[i].repl))
-            LogLine(@"   ✅ %s 已挂钩（原函数 %p）", T[i].name, real);
+            LogLine(@"   ✅ %s 已挂钩（原函数 %p，槽原值 %p，%s）", T[i].name, real, cur,
+                    isReal ? @"已解析" : @"懒绑定");
     }
 }
 
