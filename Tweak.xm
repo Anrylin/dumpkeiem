@@ -152,9 +152,17 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
                 case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM: break;
                 case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
                     symname = rd_cstr(&d);
-                    if (sampleLogged < 12 && symname) {
-                        LogLine(@"    bind 符号样例[%d]: %s", sampleLogged, symname);
-                        sampleLogged++;
+                    if (symname) {
+                        int printable = 1;
+                        for (const char *q = symname; *q; q++) {
+                            unsigned char u = (unsigned char)*q;
+                            if (u < 32 || u > 126) { printable = 0; break; }
+                        }
+                        // 把所有含 "rypt" 的符号名打出来 —— 彻底确认 CCCrypt 的真名
+                        if (printable && strstr(symname, "rypt") && sampleLogged < 24) {
+                            LogLine(@"    bind 符号(含 rypt) #%d: %s", sampleLogged, symname);
+                            sampleLogged++;
+                        }
                     }
                     break;
                 case BIND_OPCODE_SET_TYPE_IMM: break;
@@ -274,10 +282,8 @@ static int my_CCCryptorCreateWithMode(uint32_t op, uint32_t mode, uint32_t alg, 
 
 // ============================================================ 导出解密后的 UIImage（兜底）
 
-static void DumpMap(id obj, NSString *key) {
+static void DumpImageDict(NSDictionary *map, NSString *tag) {
     @try {
-        id map = nil;
-        @try { map = [obj valueForKey:key]; } @catch (NSException *e) { return; }
         if (![map isKindOfClass:[NSDictionary class]] || ![map count]) return;
         NSString *sub = [Dir() stringByAppendingPathComponent:@"icons"];
         [[NSFileManager defaultManager] createDirectoryAtPath:sub
@@ -289,12 +295,59 @@ static void DumpMap(id obj, NSString *key) {
             NSData *png = UIImagePNGRepresentation((UIImage *)v);
             if (!png) continue;
             NSString *nm = [[k description] stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+            nm = [nm stringByReplacingOccurrencesOfString:@":" withString:@"_"];
             [png writeToFile:[sub stringByAppendingPathComponent:[nm stringByAppendingString:@".png"]]
                   atomically:YES];
             if (++n >= 5000) break;
         }
-        if (n) LogLine(@"  导出 %@ 图像 %d 张 -> %@", key, n, sub);
+        if (n) LogLine(@"  >> 导出 %@ 图像 %d 张 -> icons/", tag, n);
     } @catch (NSException *e) { }
+}
+
+/// 把对象的全部 ivar 打出来：名字 / 类型 / 值的类与大小
+/// 大块 NSData 直接落盘（很可能是解密后的容器），UIImage 字典直接导 PNG
+static void DumpIvars(id obj, const char *why) {
+    @try {
+        unsigned int cnt = 0;
+        Ivar *ivs = class_copyIvarList([obj class], &cnt);
+        if (!ivs) return;
+        NSMutableString *head = [NSMutableString string];
+        for (unsigned int i = 0; i < cnt; i++) {
+            const char *n = ivar_getName(ivs[i]);
+            const char *t = ivar_getTypeEncoding(ivs[i]);
+            if (!n) continue;
+            id v = nil;
+            @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { }
+            if (!v) continue;
+            NSUInteger len = 0;
+            if ([v respondsToSelector:@selector(length)]) len = [v length];
+            else if ([v respondsToSelector:@selector(count)]) len = [v count];
+            [head appendFormat:@"%s=%@(%lu) ", n, NSStringFromClass([v class]), (unsigned long)len];
+
+            if ([v isKindOfClass:[NSData class]] && [v length] > 80000) {
+                NSString *p = [Dir() stringByAppendingPathComponent:
+                    [NSString stringWithFormat:@"ivar_%s_%lu.bin", n, (unsigned long)[v length]]];
+                [(NSData *)v writeToFile:p atomically:YES];
+                LogLine(@"  >> ivar %s 落盘 %lu 字节 -> %@", n, (unsigned long)[v length], p);
+            } else if ([v isKindOfClass:[NSDictionary class]]) {
+                DumpImageDict((NSDictionary *)v, [NSString stringWithUTF8String:n]);
+                // 字典里也可能塞着大块 NSData
+                for (id kk in (NSDictionary *)v) {
+                    id vv = ((NSDictionary *)v)[kk];
+                    if ([vv isKindOfClass:[NSData class]] && [vv length] > 80000) {
+                        NSString *p = [Dir() stringByAppendingPathComponent:
+                            [NSString stringWithFormat:@"dict_%s_%@_%lu.bin", n, kk,
+                             (unsigned long)[vv length]]];
+                        [(NSData *)vv writeToFile:p atomically:YES];
+                        LogLine(@"  >> dict %s[%@] 落盘 %lu 字节", n, kk, (unsigned long)[vv length]);
+                        break;
+                    }
+                }
+            }
+        }
+        free(ivs);
+        LogLine(@"  ivar 清单(%s): %@", why, head);
+    } @catch (NSException *e) { LogLine(@"  DumpIvars 异常 %@", e); }
 }
 
 // ============================================================ 只枚举插件镜像的类
@@ -390,6 +443,19 @@ static int InstallAES(void) {
     return done;
 }
 
+/// 只做「按值扫槽」这件事。可以在解密之后反复调用：那时懒绑定槽已被 dyld 填上真地址。
+static int HookSlotsNow(void) {
+    void *rc = dlsym(RTLD_DEFAULT, "CCCrypt");
+    if (rc && !gCCCrypt) gCCCrypt = (CCCrypt_t)rc;
+    if (!gCryptorCreate) gCryptorCreate = (CCCryptorCreate_t)dlsym(RTLD_DEFAULT, "CCCryptorCreate");
+    if (!gCryptorCreateWithMode)
+        gCryptorCreateWithMode = (CCCryptorCreate_t)dlsym(RTLD_DEFAULT, "CCCryptorCreateWithMode");
+    int h = HookViaSlots("CCCrypt", (void *)my_CCCrypt, NULL);
+    h += HookViaSlots("CCCryptorCreate", (void *)my_CCCryptorCreate, NULL);
+    h += HookViaSlots("CCCryptorCreateWithMode", (void *)my_CCCryptorCreateWithMode, NULL);
+    return h;
+}
+
 /// 解密加载入口：参数是 keiembox.dat 的路径；返回后内存里就有原版图了
 static int InstallLoader(void) {
     EnsureSeen();
@@ -416,7 +482,13 @@ static int InstallLoader(void) {
                     }
                 }
                 ((IMPV1)orig)(me, cs, a2);
-                @try { DumpMap(me, @"bgIconMap"); DumpMap(me, @"bubbleIconMap"); } @catch (NSException *e) { }
+                // ★ 关键时机：原函数刚刚解密过 → dyld 已把 CCCrypt 的懒绑定槽填上真地址。
+                //   此刻按值重扫槽位必然命中；之后的每一次解密都会被我们拿到。
+                @try {
+                    int h = HookSlotsNow();
+                    if (h) LogLine(@"★ 解密后重扫槽位命中 %d 个 —— 再切一次主题即可抓到 key", h);
+                } @catch (NSException *e) { }
+                @try { DumpIvars(me, "after-load"); } @catch (NSException *e) { }
                 @try { int n = InstallAES(); if (n) LogLine(@"补挂 AES %d 个", n); } @catch (NSException *e) { }
             });
             method_setImplementation(m, r);
