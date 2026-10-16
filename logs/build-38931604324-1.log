@@ -1,0 +1,52 @@
+[0;36m==> [1;36mNotice:[m Build may be slow as Theos isn’t using all available CPU cores on this computer. Consider upgrading GNU Make: https://theos.dev/docs/parallel-building
+[0;33m==> [1;33mWarning:[m Building for iOS 13.0, but the current toolchain can’t produce arm64e binaries for iOS earlier than 14.0. More information: https://theos.dev/docs/arm64e-deployment
+[1;31m> [1;3;39mMaking all for tweak DumpKeiem…[m
+[0;31m==> [1;39mPreprocessing Tweak.xm…[m
+[0;32m==> [1;39mCompiling Tweak.xm (arm64)…[m
+[1mTweak.xm:214:13: [0m[0;1;31merror: [0m[1munused function 'InstallFileHooks' [-Werror,-Wunused-function][0m
+static void InstallFileHooks(void) {
+[0;1;32m            ^
+[0m[1mTweak.xm:322:12: [0m[0;1;31merror: [0m[1munused function 'my_socket' [-Werror,-Wunused-function][0m
+static int my_socket(int dom, int type, int proto) {
+[0;1;32m           ^
+[0m[1mTweak.xm:331:12: [0m[0;1;31merror: [0m[1munused function 'my_connect' [-Werror,-Wunused-function][0m
+static int my_connect(int fd, const void *addr, unsigned int alen) {
+[0;1;32m           ^
+[0m[1mTweak.xm:352:12: [0m[0;1;31merror: [0m[1munused function 'my_close' [-Werror,-Wunused-function][0m
+static int my_close(int fd) {
+[0;1;32m           ^
+[0m[1mTweak.xm:1058:13: [0m[0;1;31merror: [0m[1munused function 'InstallEnvelopeHooks' [-Werror,-Wunused-function][0m
+static void InstallEnvelopeHooks(void) {
+[0;1;32m            ^
+[0m5 errors generated.
+make[3]: *** [/Users/runner/work/dumpkeiem/dumpkeiem/.theos/obj/arm64/Tweak.xm.0eccef4b.o] Error 1
+rm /Users/runner/work/dumpkeiem/dumpkeiem/.theos/obj/arm64/Tweak.xm.mm
+make[2]: *** [/Users/runner/work/dumpkeiem/dumpkeiem/.theos/obj/arm64/DumpKeiem.dylib] Error 2
+make[1]: *** [internal-library-all_] Error 2
+make: *** [DumpKeiem.all.tweak.variables] Error 2
+[0;36m==> [1;36mNotice:[m Build may be slow as Theos isn’t using all available CPU cores on this computer. Consider upgrading GNU Make: https://theos.dev/docs/parallel-building
+[0;33m==> [1;33mWarning:[m Building for iOS 13.0, but the current toolchain can’t produce arm64e binaries for iOS earlier than 14.0. More information: https://theos.dev/docs/arm64e-deployment
+[1;31m> [1;3;39mMaking all for tweak DumpKeiem…[m
+[0;31m==> [1;39mPreprocessing Tweak.xm…[m
+[0;32m==> [1;39mCompiling Tweak.xm (arm64)…[m
+[1mTweak.xm:214:13: [0m[0;1;31merror: [0m[1munused function 'InstallFileHooks' [-Werror,-Wunused-function][0m
+static void InstallFileHooks(void) {
+[0;1;32m            ^
+[0m[1mTweak.xm:322:12: [0m[0;1;31merror: [0m[1munused function 'my_socket' [-Werror,-Wunused-function][0m
+static int my_socket(int dom, int type, int proto) {
+[0;1;32m           ^
+[0m[1mTweak.xm:331:12: [0m[0;1;31merror: [0m[1munused function 'my_connect' [-Werror,-Wunused-function][0m
+static int my_connect(int fd, const void *addr, unsigned int alen) {
+[0;1;32m           ^
+[0m[1mTweak.xm:352:12: [0m[0;1;31merror: [0m[1munused function 'my_close' [-Werror,-Wunused-function][0m
+static int my_close(int fd) {
+[0;1;32m           ^
+[0m[1mTweak.xm:1058:13: [0m[0;1;31merror: [0m[1munused function 'InstallEnvelopeHooks' [-Werror,-Wunused-function][0m
+static void InstallEnvelopeHooks(void) {
+[0;1;32m            ^
+[0m5 errors generated.
+make[3]: *** [/Users/runner/work/dumpkeiem/dumpkeiem/.theos/obj/arm64/Tweak.xm.4d733bdd.o] Error 1
+rm /Users/runner/work/dumpkeiem/dumpkeiem/.theos/obj/arm64/Tweak.xm.mm
+make[2]: *** [/Users/runner/work/dumpkeiem/dumpkeiem/.theos/obj/arm64/DumpKeiem.dylib] Error 2
+make[1]: *** [internal-library-all_] Error 2
+make: *** [DumpKeiem.all.tweak.variables] Error 2
