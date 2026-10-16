@@ -39,6 +39,13 @@
 #define OFF_PBKDF2         0x50a4048UL
 #define OFF_CFReadStream   0x50a40e8UL   // _CFReadStreamRead
 #define OFF_CFWriteStream  0x50a4178UL   // _CFWriteStreamWrite
+// ★ 原始 socket（插件自己 socket+connect+send 手搓 HTTP，所以上面那些都抓不到）
+#define OFF_send           0x50a4aa0UL
+#define OFF_sendto         0x50a4aa8UL
+#define OFF_recv           0x50a4a68UL
+#define OFF_recvfrom       0x50a4a70UL
+#define OFF_write          0x50a4b50UL
+#define OFF_read           0x50a4a58UL
 
 // ============================================================ 目录与日志
 
@@ -173,6 +180,59 @@ static long my_CFRead(void *s, uint8_t *buf, long len) {
     return r;
 }
 
+// ---- 最底层：原始 socket（send/recv/write/read）----
+typedef long (*SockSend_t)(int fd, const void *buf, long len, int flags);
+typedef long (*SockRecv_t)(int fd, void *buf, long len, int flags);
+typedef long (*IORW_t)(int fd, const void *buf, long len);
+
+static SockSend_t gSend = NULL, gSendto = NULL;
+static SockRecv_t gRecv = NULL, gRecvfrom = NULL;
+static IORW_t     gWrite = NULL, gRead = NULL;
+static volatile int gSockCount = 0;
+
+static void LogWire(const char *tag, const void *buf, long len) {
+    @try {
+        if (gSockCount >= 400 || !buf || len <= 0) return;
+        if (!LooksHTTP((const uint8_t *)buf, len)) return;
+        gSockCount++;
+        NSString *txt = [[NSString alloc] initWithBytes:buf length:MIN((long)700, len)
+                                              encoding:NSUTF8StringEncoding];
+        LogLine(@"[%s %ldB] %@", tag, len, txt ? txt : HexStr(buf, len, 260));
+    } @catch (NSException *e) { }
+}
+
+static long my_send(int fd, const void *buf, long len, int flags) {
+    LogWire("WIRE-OUT", buf, len);
+    return gSend ? gSend(fd, buf, len, flags) : -1;
+}
+static long my_sendto(int fd, const void *buf, long len, int flags,
+                      const void *addr, unsigned int alen) {
+    LogWire("WIRE-OUT", buf, len);
+    typedef long (*T)(int, const void *, long, int, const void *, unsigned int);
+    return gSendto ? ((T)gSendto)(fd, buf, len, flags, addr, alen) : -1;
+}
+static long my_recv(int fd, void *buf, long len, int flags) {
+    long r = gRecv ? gRecv(fd, buf, len, flags) : -1;
+    if (r > 0) LogWire("WIRE-IN ", buf, r);
+    return r;
+}
+static long my_recvfrom(int fd, void *buf, long len, int flags, void *addr, void *alen) {
+    typedef long (*T)(int, void *, long, int, void *, void *);
+    long r = gRecvfrom ? ((T)gRecvfrom)(fd, buf, len, flags, addr, alen) : -1;
+    if (r > 0) LogWire("WIRE-IN ", buf, r);
+    return r;
+}
+static long my_write(int fd, const void *buf, long len) {
+    if (len >= 16 && len <= 65536) LogWire("WIRE-OUT", buf, len);
+    return gWrite ? gWrite(fd, buf, len) : -1;
+}
+static long my_read(int fd, void *buf, long len) {
+    long r = gRead ? gRead(fd, buf, len) : -1;
+    if (r >= 16 && r <= 65536) LogWire("WIRE-IN ", buf, r);
+    return r;
+}
+
+
 
 static void SaveKeyJSON(NSString *via, NSString *keyHex, NSString *ivHex,
                         size_t keyLen, size_t cipherLen, NSString *cipherHead) {
@@ -273,38 +333,37 @@ static void InstallCryptoHooks(void) {
     LogLine(@"路B：镜像基址 %p  dlsym CCCrypt=%p CCHmac=%p PBKDF2=%p",
             base, (void *)gCCCrypt, (void *)gCCHmac, (void *)gPBKDF2);
 
-    struct { unsigned long off; void *repl; void **slot; const char *name; } T[] = {
-        { OFF_CCCrypt, (void *)my_CCCrypt, NULL, "CCCrypt" },
-        { OFF_CCHmac,  (void *)my_CCHmac,  NULL, "CCHmac" },
-        { OFF_PBKDF2,  (void *)my_PBKDF2,  NULL, "CCKeyDerivationPBKDF" },
-        { OFF_CFWriteStream, (void *)my_CFWrite, (void **)&gCFWrite, "CFWriteStreamWrite" },
-        { OFF_CFReadStream,  (void *)my_CFRead,  (void **)&gCFRead,  "CFReadStreamRead" },
+    struct { unsigned long off; void *repl; void **store; const char *name; } T[] = {
+        { OFF_CCCrypt,       (void *)my_CCCrypt, (void **)&gCCCrypt,  "CCCrypt" },
+        { OFF_CCHmac,        (void *)my_CCHmac,  (void **)&gCCHmac,   "CCHmac" },
+        { OFF_PBKDF2,        (void *)my_PBKDF2,  (void **)&gPBKDF2,   "CCKeyDerivationPBKDF" },
+        { OFF_CFWriteStream, (void *)my_CFWrite, (void **)&gCFWrite,  "CFWriteStreamWrite" },
+        { OFF_CFReadStream,  (void *)my_CFRead,  (void **)&gCFRead,   "CFReadStreamRead" },
+        { OFF_send,          (void *)my_send,    (void **)&gSend,     "send" },
+        { OFF_sendto,        (void *)my_sendto,  (void **)&gSendto,   "sendto" },
+        { OFF_recv,          (void *)my_recv,    (void **)&gRecv,     "recv" },
+        { OFF_recvfrom,      (void *)my_recvfrom,(void **)&gRecvfrom, "recvfrom" },
+        { OFF_write,         (void *)my_write,   (void **)&gWrite,    "write" },
+        { OFF_read,          (void *)my_read,    (void **)&gRead,     "read" },
     };
-    for (int i = 0; i < 5; i++) {
+    int n = (int)(sizeof(T) / sizeof(T[0]));
+    for (int i = 0; i < n; i++) {
         void **slot = (void **)((uintptr_t)base + T[i].off);
         void *cur = *slot;
-        LogLine(@"   %s 槽 %p 当前值 %p", T[i].name, (void *)slot, cur);
         if (!cur) { LogLine(@"   !! %s 槽为空，跳过", T[i].name); continue; }
         if (cur == T[i].repl) { LogLine(@"   %s 已挂过", T[i].name); continue; }
-        void *real = NULL;
-        if (i == 0) real = (void *)gCCCrypt;
-        else if (i == 1) real = (void *)gCCHmac;
-        else if (i == 2) real = (void *)gPBKDF2;
-        else if (i == 3) {
-            if (!gCFWrite) gCFWrite = (CFWrite_t)dlsym(RTLD_DEFAULT, "CFWriteStreamWrite");
-            real = (void *)gCFWrite;
-        } else {
-            if (!gCFRead) gCFRead = (CFRead_t)dlsym(RTLD_DEFAULT, "CFReadStreamRead");
-            real = (void *)gCFRead;
-        }
+
+        // 原函数统一用 dlsym 取（懒绑定槽里的值不可靠）
+        void *real = dlsym(RTLD_DEFAULT, T[i].name);
         if (!real) { LogLine(@"   !! dlsym %s 失败，跳过", T[i].name); continue; }
-        // ★ 自校验：槽里的值必须「像未解析的 stub-helper（落在插件镜像内）」
-        //   或「等于 dlsym 拿到的真函数」。两者都不是 → 偏移不对，绝不写，防止挂错函数导致崩溃。
+        if (T[i].store && !*T[i].store) *T[i].store = real;
+
+        // 自校验：槽值必须「落在插件镜像内」(未解析的 stub-helper) 或「等于真函数」
         uintptr_t cu = (uintptr_t)cur, bu = (uintptr_t)base, ru = (uintptr_t)real;
         BOOL inImage = (cu >= bu && cu < bu + 0x8000000UL);
         BOOL isReal  = (cu == ru);
         if (!inImage && !isReal) {
-            LogLine(@"   !! %s 槽值 %p 不像 stub-helper 也不像真函数(%p)，偏移可能不对，跳过",
+            LogLine(@"   !! %s 槽值 %p 不像 stub-helper 也不像真函数(%p)，跳过",
                     T[i].name, cur, real);
             continue;
         }
