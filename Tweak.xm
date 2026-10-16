@@ -910,7 +910,62 @@ static void InstallNetworkLogger(void) {
             }));
     }
 
-    // ⑪ 打印所有已加载镜像 —— 用来找出真正做 HTTP 的那个 framework
+    // ⑫ +[NSURL URLWithString:relativeToURL:]  ← 插件就是这样拼 URL 的！
+    SEL s12 = @selector(URLWithString:relativeToURL:);
+    Method m12 = class_getClassMethod([NSURL class], s12);
+    if (m12) {
+        IMP o12 = method_getImplementation(m12);
+        HookClass([NSURL class], s12,
+            imp_implementationWithBlock(^id(id cls, NSString *str, NSURL *base) {
+                id r = ((id(*)(id, SEL, id, id))o12)(cls, s12, str, base);
+                @try {
+                    NSString *full = [r absoluteString];
+                    if (IsApiURL(full))
+                        NetLog(@"NSURL rel: base=%@ + %@ → %@", base, str, full);
+                } @catch (NSException *e) { }
+                return r;
+            }));
+    }
+
+    // ⑬ -[NSURL absoluteString] —— 任何取完整 URL 的地方都经过这里
+    SEL s13 = @selector(absoluteString);
+    Method m13 = class_getInstanceMethod([NSURL class], s13);
+    if (m13) {
+        IMP o13 = method_getImplementation(m13);
+        HookInstance([NSURL class], s13, imp_implementationWithBlock(^id(id me) {
+            id r = ((id(*)(id, SEL))o13)(me, s13);
+            @try {
+                if ([r isKindOfClass:[NSString class]] && IsApiURL(r))
+                    NetLog(@"URL.absoluteString = %@", r);
+            } @catch (NSException *e) { }
+            return r;
+        }));
+    }
+
+    // ⑭ +[NSURL URLWithString:relativeToURL:] 之外的：NSURLComponents 组装
+    Class NSComp = objc_getClass("NSURLComponents");
+    if (NSComp) {
+        NSArray *sets = @[@"setScheme:", @"setHost:", @"setPath:", @"setQuery:",
+                          @"setPort:", @"setPercentEncodedPath:"];
+        for (NSString *sn in sets) {
+            SEL s = NSSelectorFromString(sn);
+            Method m = class_getInstanceMethod(NSComp, s);
+            if (!m) continue;
+            IMP o = method_getImplementation(m);
+            NSString *idk = [NSString stringWithFormat:@"C:%s|%p", sel_getName(s), o];
+            if ([gSeen containsObject:idk]) continue;
+            [gSeen addObject:idk];
+            SEL cs = s;
+            method_setImplementation(m, imp_implementationWithBlock(^void(id me, id v) {
+                @try { NetLog(@"NSURLComponents %@ = %@", NSStringFromSelector(cs), v); }
+                @catch (NSException *e) { }
+                ((void(*)(id, SEL, id))o)(me, cs, v);
+            }));
+        }
+        LogLine(@"  net 挂钩 NSURLComponents");
+    }
+
+    // ⑮ 打印所有已加载镜像 —— 用来找出真正做 HTTP 的那个 framework
     @try {
         uint32_t n = _dyld_image_count();
         LogLine(@"已加载镜像 %u 个：", n);
