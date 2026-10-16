@@ -783,9 +783,23 @@ static id FindReceiptTarget(void) {
 
 static void RunReceipts(void) {
     @try {
-        NSString *lp = @"/var/mobile/Media/km_codes.txt";
-        NSString *txt = [NSString stringWithContentsOfFile:lp encoding:NSUTF8StringEncoding error:nil];
-        if (!txt) { LogLine(@"收据批量：缺少 %@（需要它才有主题清单）", lp); return; }
+        // 依次尝试多个位置（roothide 下 /var/mobile/Media 可能读不到，沙盒最可靠）
+        NSArray *paths = @[
+            @"/var/mobile/Media/km_codes.txt",
+            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/km_codes.txt"],
+            [[Dir() stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"km_codes.txt"],
+        ];
+        NSString *lp = nil;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *p in paths)
+            if ([fm fileExistsAtPath:p]) { lp = p; break; }
+        NSString *txt = lp ? [NSString stringWithContentsOfFile:lp encoding:NSUTF8StringEncoding error:nil] : nil;
+        if (!txt) {
+            LogLine(@"收据批量：找不到 km_codes.txt（随便放一个位置都行）：");
+            for (NSString *p in paths) LogLine(@"    候选：%@", p);
+            return;
+        }
+        LogLine(@"收据批量：清单来自 %@", lp);
         SEL sel = @selector(fetchAndSaveReceiptForTheme:);
         id tgt = FindReceiptTarget();
         if (!tgt) { LogLine(@"收据批量：找不到实现 fetchAndSaveReceiptForTheme: 的对象"); return; }
