@@ -1518,13 +1518,13 @@ static void InitDump(void) {
         (void)Dir();
         // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
         LogLine(@"############################################################");
-        LogLine(@"##########  DumpKeiem v25  BUILD-C4  2026-10-16  ###########");
+        LogLine(@"##########  DumpKeiem v26  BUILD-C5  2026-10-16  ###########");
         LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
         LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
         // 额外写一份版本标记到稳定位置，方便确认
         @try {
-            NSString *tag = @"DumpKeiem v25 BUILD-C4\n";
+            NSString *tag = @"DumpKeiem v26 BUILD-C5\n";
             for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
                                   [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
                 [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -1540,18 +1540,23 @@ static void InitDump(void) {
             }
             LogLine(@"初始化流程结束");
             @try { RunBulk(); } @catch (NSException *e) { }
-            // ★ 等插件对象出现（最多 120 秒）—— 打开主题商店它就出现，随即开跑
-            for (int w = 0; w < 60; w++) {
+            // ★ 等插件对象（最多 60 秒），然后尝试 alloc init 兜底
+            for (int w = 0; w < 30; w++) {
                 if (gCfg) break;
-                if (w % 5 == 0) LogLine(@"等待插件对象… %d 秒（请打开主题商店）", w * 2);
+                if (w % 5 == 0) LogLine(@"等待插件对象… %d 秒", w * 2);
                 [NSThread sleepForTimeInterval:2.0];
             }
             if (!gCfg) {
-                LogLine(@"!!! 始终没拿到插件对象 —— 必须打开一次主题商店，前台停留 1 分钟");
-            } else {
+                LogLine(@"gCfg 未捕获，尝试直接实例化插件对象");
+                id tgt = FindReceiptTarget();   // ← 这里才会走 alloc init
+                if (tgt) { gCfg = tgt; LogLine(@"直接实例化成功，开始收据批量"); }
+            }
+            if (gCfg) {
                 LogLine(@"插件对象已就位，开始收据批量");
                 @try { RunReceipts(); } @catch (NSException *e) { }
                 @try { RunBulk(); } @catch (NSException *e) { }
+            } else {
+                LogLine(@"!!! 三种途径都没拿到插件对象");
             }
             LogLine(@"流程结束（累计密钥 %d）", gKeysFound);
         });
