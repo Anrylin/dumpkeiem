@@ -18,6 +18,7 @@
 #import <string.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <dlfcn.h>
 
 #define PLUGIN_HINT "NewMessageRingUtil"
 #define kDirMedia  @"/var/mobile/Media/keiem_dump"
@@ -119,9 +120,13 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
         if (lc->cmdsize == 0) break;
         p += lc->cmdsize;
     }
-    if (!dyld) return 0;
+    if (!dyld) {
+        LogLine(@"  !! 该镜像没有 LC_DYLD_INFO（可能用 chained fixups）");
+        return 0;
+    }
 
     int total = 0;
+    int sampleLogged = 0;
     for (int pass = 0; pass < 2; pass++) {
         uint32_t off  = pass ? dyld->lazy_bind_off : dyld->bind_off;
         uint32_t size = pass ? dyld->lazy_bind_size : dyld->bind_size;
@@ -145,7 +150,13 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
                 case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: break;
                 case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB: rd_uleb(&d); break;
                 case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM: break;
-                case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: symname = rd_cstr(&d); break;
+                case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+                    symname = rd_cstr(&d);
+                    if (sampleLogged < 12 && symname) {
+                        LogLine(@"    bind 符号样例[%d]: %s", sampleLogged, symname);
+                        sampleLogged++;
+                    }
+                    break;
                 case BIND_OPCODE_SET_TYPE_IMM: break;
                 case BIND_OPCODE_SET_ADDEND_SLEB: rd_sleb(&d); break;
                 case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: seg = imm; seg_off = rd_uleb(&d); break;
@@ -170,7 +181,8 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
                                 void **pp = (void **)slot;
                                 void *cur = *pp;
                                 if (!cur) continue;
-                                if (items[k].orig) *items[k].orig = cur;
+                                // 懒绑定槽里放的可能不是真函数，所以原函数优先用 dlsym 拿到的
+                                if (items[k].orig && !*items[k].orig) *items[k].orig = cur;
                                 *pp = items[k].repl;
                                 items[k].hits++;
                                 total++;
@@ -455,12 +467,64 @@ static int InstallBypass(void) {
 
 static int gRebindTotal = 0;
 
-static void DoRebind(void) {
+/// 方法一（主力）：不解析 bind 表，直接扫镜像里的符号指针槽。
+/// 原理：dyld 已经把真函数地址填进了 __la_symbol_ptr / __got 槽；
+///       我们只要找"值等于 dlsym(sym)"的槽，把它换成自己的函数即可。
+/// 这种方法对 chained fixups / 经典 bind 都有效，也不受符号名下划线影响。
+static int HookViaSlots(const char *sym, void *repl, void **orig) {
+    void *real = dlsym(RTLD_DEFAULT, sym);
+    if (!real) {
+        LogLine(@"  dlsym(%s) 失败（找不到该 C 函数）", sym);
+        return 0;
+    }
+    int hits = 0;
+    uint32_t nimg = _dyld_image_count();
+    for (uint32_t i = 0; i < nimg; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path || !strstr(path, PLUGIN_HINT)) continue;
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (mh->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        const struct segment_command_64 *segs[64];
+        int nsegs = 0;
+        const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds && nsegs < 64; c++) {
+            const struct load_command *lc = (const struct load_command *)p;
+            if (lc->cmd == LC_SEGMENT_64) segs[nsegs++] = (const struct segment_command_64 *)lc;
+            if (!lc->cmdsize) break;
+            p += lc->cmdsize;
+        }
+        for (int s = 0; s < nsegs; s++) {
+            const struct section_64 *sec = (const struct section_64 *)
+                ((const uint8_t *)segs[s] + sizeof(struct segment_command_64));
+            for (uint32_t k = 0; k < segs[s]->nsects; k++, sec++) {
+                uint32_t t = sec->flags & SECTION_TYPE;
+                if (t != S_LAZY_SYMBOL_POINTERS && t != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                uintptr_t base = (uintptr_t)mh + slide + sec->addr;
+                size_t cnt = (size_t)(sec->size / 8);
+                for (size_t j = 0; j < cnt; j++) {
+                    void **slot = (void **)(base + j * 8);
+                    if (*slot != real) continue;
+                    if (orig && !*orig) *orig = *slot;
+                    *slot = repl;
+                    hits++;
+                    LogLine(@"  槽命中 %s  %s.%s[%zu] @%p", sym, segs[s]->segname, sec->sectname, j, (void *)slot);
+                }
+            }
+        }
+    }
+    return hits;
+}
+
+/// 方法二（备用）：解析 bind 表。注意 bind 表里的符号名带前导下划线（_CCCrypt）。
+static void DoRebindBindTable(void) {
     RebindItem items[] = {
-        { "CCCrypt",                 (void *)my_CCCrypt,         (void **)&gCCCrypt },
-        { "CCCryptorCreate",         (void *)my_CCCryptorCreate, (void **)&gCryptorCreate },
-        { "CCCryptorCreateWithMode", (void *)my_CCCryptorCreateWithMode,
-                                     (void **)&gCryptorCreateWithMode },
+        { "_CCCrypt",                 (void *)my_CCCrypt,         (void **)&gCCCrypt },
+        { "_CCCryptorCreate",         (void *)my_CCCryptorCreate, (void **)&gCryptorCreate },
+        { "_CCCryptorCreateWithMode", (void *)my_CCCryptorCreateWithMode,
+                                      (void **)&gCryptorCreateWithMode },
     };
     int n = (int)(sizeof(items) / sizeof(items[0]));
     uint32_t nimg = _dyld_image_count();
@@ -470,11 +534,41 @@ static void DoRebind(void) {
         const struct mach_header_64 *mh =
             (const struct mach_header_64 *)_dyld_get_image_header(i);
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        if ((mh->magic & 0xFFFFFFFF) == MH_MAGIC_64) {
-            int h = Rebind(mh, slide, items, n);
-            gRebindTotal += h;
+        if (mh->magic != MH_MAGIC_64) continue;
+        int h = Rebind(mh, slide, items, n);
+        if (h) LogLine(@"  bind 表命中 %d 个", h);
+        gRebindTotal += h;
+    }
+}
+
+static void DoRebind(void) {
+    // 先看插件镜像到底加载了没
+    int found = 0;
+    uint32_t nimg = _dyld_image_count();
+    for (uint32_t i = 0; i < nimg; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (path && strstr(path, PLUGIN_HINT)) {
+            if (!found) LogLine(@"插件镜像已加载: %s", path);
+            found++;
         }
     }
+    if (!found) { LogLine(@"插件镜像尚未加载"); return; }
+
+    // ★ 先用 dlsym 把「真函数」拿到手。懒绑定槽里的值不可靠，原函数必须从这里来。
+    if (!gCCCrypt)          gCCCrypt          = (CCCrypt_t)dlsym(RTLD_DEFAULT, "CCCrypt");
+    if (!gCryptorCreate)    gCryptorCreate    = (CCCryptorCreate_t)dlsym(RTLD_DEFAULT, "CCCryptorCreate");
+    if (!gCryptorCreateWithMode)
+        gCryptorCreateWithMode = (CCCryptorCreate_t)dlsym(RTLD_DEFAULT, "CCCryptorCreateWithMode");
+    LogLine(@"dlsym: CCCrypt=%p CCCryptorCreate=%p CCCryptorCreateWithMode=%p",
+            (void *)gCCCrypt, (void *)gCryptorCreate, (void *)gCryptorCreateWithMode);
+
+    // 主力：扫非懒绑定槽（__got）——值等于真函数地址的直接换掉
+    int h1 = HookViaSlots("CCCrypt", (void *)my_CCCrypt, NULL);
+    if (h1) LogLine(@"__got 槽命中 %d 个", h1);
+
+    // 关键：解析 bind 表定位懒绑定槽（__la_symbol_ptr），原函数已由 dlsym 提供
+    DoRebindBindTable();
+    LogLine(@"重绑定累计命中 %d 个槽", gRebindTotal);
 }
 
 static void InstallAll(int round) {
