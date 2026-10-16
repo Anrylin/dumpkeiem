@@ -287,6 +287,21 @@ static void RunBulk(void) {
 
 typedef void (*IMPV1)(id, SEL, id);
 
+// ivar 清单 + 原版 PNG 导出：延迟到后台、只做一次（重活绝不放在插件调用路径上）
+static volatile int gIvarDumped = 0;
+
+static void DeferredIvars(id obj) {
+    if (gIvarDumped) return;
+    gIvarDumped = 1;
+    id strong = obj;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            @try { DumpIvars(strong, "after-load"); } @catch (NSException *e) { }
+        }
+    });
+}
+
 static int InstallLoader(void) {
     EnsureSeen();
     int done = 0;
@@ -331,6 +346,7 @@ static int InstallLoader(void) {
                         }
                     }
                 } @catch (NSException *e) { }
+                @try { DeferredIvars(me); } @catch (NSException *e) { }
             });
             method_setImplementation(m, r);
             done++;
