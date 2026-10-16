@@ -46,6 +46,9 @@
 #define OFF_recvfrom       0x50a4a70UL
 #define OFF_write          0x50a4b50UL
 #define OFF_read           0x50a4a58UL
+#define OFF_socket         0x50a4ad0UL
+#define OFF_connect        0x50a46a0UL
+#define OFF_close          0x50a4698UL
 
 // ============================================================ 目录与日志
 
@@ -180,21 +183,181 @@ static long my_CFRead(void *s, uint8_t *buf, long len) {
     return r;
 }
 
-// ---- 最底层：原始 socket（send/recv/write/read）----
+// ---- 密钥包持久化：224/240 字节的加解密一律落盘 + 追踪它从哪个文件读出来的 ----
+static NSMutableSet *gSeen = nil;
+static void EnsureSeen(void) { if (!gSeen) gSeen = [NSMutableSet set]; }
+
+static volatile int gKpCount = 0;
+
+static void SaveKeyPacket(const char *tag, const void *buf, size_t len) {
+    @try {
+        if (!buf || len < 200 || len > 300) return;
+        if (gKpCount >= 200) return;
+        gKpCount++;
+        NSString *h = HexStr(buf, len, 64);
+        NSString *p = [Dir() stringByAppendingPathComponent:
+                       [NSString stringWithFormat:@"KP/%@_%lu_%@.bin", @(tag),
+                        (unsigned long)len, [h substringToIndex:16]]];
+        [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        [[NSData dataWithBytes:buf length:len] writeToFile:p atomically:YES];
+    } @catch (NSException *e) { }
+}
+
+static BOOL InterestingSize(NSUInteger n) {
+    return (n >= 200 && n <= 300) || (n >= 60 && n <= 80) || (n >= 300 && n <= 400);
+}
+
+// ---- 追踪「读文件」：密钥包从哪个文件来的 ----
+typedef id (*DataFile_t)(id, SEL, id);
+
+static void InstallFileHooks(void) {
+    EnsureSeen();
+    Class NSD = [NSData class];
+
+    NSArray *inits = @[@"initWithContentsOfFile:", @"initWithContentsOfURL:",
+                       @"dataWithContentsOfFile:", @"dataWithContentsOfURL:"];
+    for (NSString *sn in inits) {
+        SEL s = NSSelectorFromString(sn);
+        Method m = class_getClassMethod(NSD, s) ?: class_getInstanceMethod(NSD, s);
+        if (!m) continue;
+        IMP o = method_getImplementation(m);
+        NSString *idk = [NSString stringWithFormat:@"F:%s|%p", sel_getName(s), o];
+        if ([gSeen containsObject:idk]) continue;
+        [gSeen addObject:idk];
+        SEL cs = s;
+        method_setImplementation(m, imp_implementationWithBlock(^id(id me, id arg) {
+            id r = ((id(*)(id, SEL, id))o)(me, cs, arg);
+            @try {
+                NSUInteger n = [r isKindOfClass:[NSData class]] ? [r length] : 0;
+                if (InterestingSize(n)) {
+                    NSString *a = [arg isKindOfClass:[NSURL class]]
+                                  ? [(NSURL *)arg path] : [arg description];
+                    LogLine(@"[FILE-READ %luB] %@  ← %@", (unsigned long)n,
+                            [a lastPathComponent], a);
+                    SaveKeyPacket("read", [r bytes], n);
+                }
+            } @catch (NSException *e) { }
+            return r;
+        }));
+    }
+
+    // 写文件：密钥包被存到哪
+    NSArray *writes = @[@"writeToFile:atomically:", @"writeToURL:options:error:",
+                        @"writeToFile:options:error:"];
+    for (NSString *sn in writes) {
+        SEL s = NSSelectorFromString(sn);
+        Method m = class_getInstanceMethod(NSD, s);
+        if (!m) continue;
+        IMP o = method_getImplementation(m);
+        NSString *idk = [NSString stringWithFormat:@"W:%s|%p", sel_getName(s), o];
+        if ([gSeen containsObject:idk]) continue;
+        [gSeen addObject:idk];
+        SEL cs = s;
+        if ([sn isEqualToString:@"writeToFile:atomically:"]) {
+            method_setImplementation(m, imp_implementationWithBlock(^BOOL(id me, id path, BOOL atom) {
+                @try {
+                    NSUInteger n = [me length];
+                    if (InterestingSize(n)) {
+                        NSString *a = [path isKindOfClass:[NSURL class]]
+                                      ? [(NSURL *)path path] : [path description];
+                        LogLine(@"[FILE-WRITE %luB] %@  → %@", (unsigned long)n,
+                                [a lastPathComponent], a);
+                        SaveKeyPacket("write", [me bytes], n);
+                    }
+                } @catch (NSException *e) { }
+                return ((BOOL(*)(id, SEL, id, BOOL))o)(me, cs, path, atom);
+            }));
+        } else {
+            method_setImplementation(m, imp_implementationWithBlock(^BOOL(id me, id arg1, NSUInteger opt, id err) {
+                @try {
+                    NSUInteger n = [me length];
+                    if (InterestingSize(n)) {
+                        NSString *a = [arg1 isKindOfClass:[NSURL class]]
+                                      ? [(NSURL *)arg1 path] : [arg1 description];
+                        LogLine(@"[FILE-WRITE %luB] %@  → %@", (unsigned long)n,
+                                [a lastPathComponent], a);
+                        SaveKeyPacket("write", [me bytes], n);
+                    }
+                } @catch (NSException *e) { }
+                return ((BOOL(*)(id, SEL, id, NSUInteger, id))o)(me, cs, arg1, opt, err);
+            }));
+        }
+    }
+    LogLine(@"  已装文件读写追踪");
+}
+
+// ---- 最底层：原始 socket（socket/connect/send/recv/write/read）----
 typedef long (*SockSend_t)(int fd, const void *buf, long len, int flags);
 typedef long (*SockRecv_t)(int fd, void *buf, long len, int flags);
 typedef long (*IORW_t)(int fd, const void *buf, long len);
+typedef int  (*SockOpen_t)(int dom, int type, int proto);
+typedef int  (*SockConn_t)(int fd, const void *addr, unsigned int alen);
+typedef int  (*SockClose_t)(int fd);
 
 static SockSend_t gSend = NULL, gSendto = NULL;
 static SockRecv_t gRecv = NULL, gRecvfrom = NULL;
 static IORW_t     gWrite = NULL, gRead = NULL;
+static SockOpen_t gSocket = NULL;
+static SockConn_t gConnect = NULL;
+static SockClose_t gClose = NULL;
 static volatile int gSockCount = 0;
 static volatile long gNsend = 0, gNsendto = 0, gNrecv = 0, gNrecvfrom = 0, gNwrite = 0, gNread = 0;
 static volatile long gNhttp = 0;
+static volatile long gNconn = 0;
+static volatile int  gRawBytes = 0;
+
+// fd → 目标 "ip:port"
+#define FDMAP_N 2048
+static char gFdDest[FDMAP_N][72];
+
+static void NoteFd(int fd, const char *s) {
+    if (fd >= 0 && fd < FDMAP_N && s) { strlcpy(gFdDest[fd], s, 72); }
+}
+static const char *FdDest(int fd) {
+    if (fd >= 0 && fd < FDMAP_N && gFdDest[fd][0]) return gFdDest[fd];
+    return "?";
+}
+
+static int my_socket(int dom, int type, int proto) {
+    int fd = gSocket ? gSocket(dom, type, proto) : -1;
+    if (fd >= 0 && gNconn < 200) {
+        gNconn++;
+        LogLine(@"[SOCKET fd=%d] domain=%d type=%d proto=%d", fd, dom, type, proto);
+    }
+    return fd;
+}
+
+static int my_connect(int fd, const void *addr, unsigned int alen) {
+    @try {
+        const uint8_t *a = (const uint8_t *)addr;
+        char buf[72] = "";
+        if (a && alen >= 8) {
+            int fam = a[1];
+            if (fam == 2) {
+                snprintf(buf, sizeof buf, "%u.%u.%u.%u:%u", a[4], a[5], a[6], a[7],
+                         (unsigned)((a[2] << 8) | a[3]));
+            } else if (fam == 30) {
+                snprintf(buf, sizeof buf, "[v6]:%u", (unsigned)((a[2] << 8) | a[3]));
+            } else {
+                snprintf(buf, sizeof buf, "fam=%d", fam);
+            }
+        }
+        NoteFd(fd, buf);
+        LogLine(@"[CONNECT fd=%d] %s", fd, buf[0] ? buf : "?");
+    } @catch (NSException *e) { }
+    return gConnect ? gConnect(fd, addr, alen) : -1;
+}
+
+static int my_close(int fd) {
+    if (fd >= 0 && fd < FDMAP_N) gFdDest[fd][0] = 0;
+    return gClose ? gClose(fd) : -1;
+}
 
 static void LogWire(const char *tag, const void *buf, long len) {
     @try {
         if (gSockCount >= 400 || !buf || len <= 0) return;
+
         if (!LooksHTTP((const uint8_t *)buf, len)) return;
         gSockCount++;
         gNhttp++;
@@ -204,40 +367,55 @@ static void LogWire(const char *tag, const void *buf, long len) {
     } @catch (NSException *e) { }
 }
 
+// ★ 无条件记录原始字节（用来逆 receiptSocket 的自定义协议）
+static void LogRaw(int fd, const char *tag, const void *buf, long len) {
+    @try {
+        if (gRawBytes >= 600 || !buf || len <= 0 || len > 200000) return;
+        gRawBytes++;
+        NSString *txt = [[NSString alloc] initWithBytes:buf length:MIN((long)260, len)
+                                              encoding:NSUTF8StringEncoding];
+        LogLine(@"[%s fd=%d %s %ldB] %@", tag, fd, FdDest(fd), len,
+                txt ? [txt stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]
+                    : HexStr(buf, len, 200));
+    } @catch (NSException *e) { }
+}
+
 static long my_send(int fd, const void *buf, long len, int flags) {
     gNsend++;
     LogWire("WIRE-OUT", buf, len);
+    LogRaw(fd, "RAW-OUT", buf, len);
     return gSend ? gSend(fd, buf, len, flags) : -1;
 }
 static long my_sendto(int fd, const void *buf, long len, int flags,
                       const void *addr, unsigned int alen) {
     gNsendto++;
     LogWire("WIRE-OUT", buf, len);
+    LogRaw(fd, "RAW-OUT", buf, len);
     typedef long (*T)(int, const void *, long, int, const void *, unsigned int);
     return gSendto ? ((T)gSendto)(fd, buf, len, flags, addr, alen) : -1;
 }
 static long my_recv(int fd, void *buf, long len, int flags) {
     gNrecv++;
     long r = gRecv ? gRecv(fd, buf, len, flags) : -1;
-    if (r > 0) LogWire("WIRE-IN ", buf, r);
+    if (r > 0) { LogWire("WIRE-IN ", buf, r); LogRaw(fd, "RAW-IN ", buf, r); }
     return r;
 }
 static long my_recvfrom(int fd, void *buf, long len, int flags, void *addr, void *alen) {
     gNrecvfrom++;
     typedef long (*T)(int, void *, long, int, void *, void *);
     long r = gRecvfrom ? ((T)gRecvfrom)(fd, buf, len, flags, addr, alen) : -1;
-    if (r > 0) LogWire("WIRE-IN ", buf, r);
+    if (r > 0) { LogWire("WIRE-IN ", buf, r); LogRaw(fd, "RAW-IN ", buf, r); }
     return r;
 }
 static long my_write(int fd, const void *buf, long len) {
     gNwrite++;
-    if (len >= 16 && len <= 65536) LogWire("WIRE-OUT", buf, len);
+    if (len >= 16 && len <= 65536) { LogWire("WIRE-OUT", buf, len); LogRaw(fd, "RAW-OUT", buf, len); }
     return gWrite ? gWrite(fd, buf, len) : -1;
 }
 static long my_read(int fd, void *buf, long len) {
     gNread++;
     long r = gRead ? gRead(fd, buf, len) : -1;
-    if (r >= 16 && r <= 65536) LogWire("WIRE-IN ", buf, r);
+    if (r >= 16 && r <= 65536) { LogWire("WIRE-IN ", buf, r); LogRaw(fd, "RAW-IN ", buf, r); }
     return r;
 }
 
@@ -259,6 +437,63 @@ static void SaveKeyJSON(NSString *via, NSString *keyHex, NSString *ivHex,
     else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
 }
 
+static int gKeysFound = 0;
+
+// ★ 把「设备身份」和「卡密」攒进 identity.json —— PC 端复现请求要用
+static void RecordIdentityFromPlain(const void *p, size_t n) {
+    @try {
+        if (!p || n < 60 || n > 1200) return;
+        NSString *s = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding];
+        if (!s) return;
+        NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![j isKindOfClass:[NSDictionary class]]) return;
+        NSMutableDictionary *acc = [NSMutableDictionary dictionary];
+        NSString *fp = [Dir() stringByAppendingPathComponent:@"identity.json"];
+        NSData *old = [NSData dataWithContentsOfFile:fp];
+        if (old) {
+            NSDictionary *o = [NSJSONSerialization JSONObjectWithData:old options:0 error:nil];
+            if ([o isKindOfClass:[NSDictionary class]]) [acc addEntriesFromDictionary:o];
+        }
+        for (NSString *k in @[@"ts", @"sign", @"uid", @"bundleId", @"version",
+                              @"uu", @"vv", @"ov", @"ss", @"bb", @"cmd", @"tt",
+                              @"hm", @"dev", @"nonce", @"sessionKey", @"ek", @"iv"])
+            if (j[k]) acc[k] = j[k];
+        // 那些随机十六进制命名的字段也留着（卡密/设备指纹）
+        for (NSString *k in j)
+            if (k.length == 32 && [k rangeOfCharacterFromSet:
+                    [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"]].location != NSNotFound)
+                acc[k] = j[k];
+        NSData *out = [NSJSONSerialization dataWithJSONObject:acc
+                        options:NSJSONWritingPrettyPrinted error:nil];
+        [out writeToFile:fp atomically:YES];
+    } @catch (NSException *e) { }
+}
+
+// ★ 每解出一个密钥包，就把 {themeID, iv, key, name} 追加到 keys_found.tsv
+static void RecordKeyFromPlain(const void *p, size_t n) {
+    @try {
+        if (!p || n < 60 || n > 700) return;
+        NSString *s = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding];
+        if (!s) return;
+        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSData *d = [[NSData alloc] initWithBase64EncodedString:s
+                                                        options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (!d || d.length < 40) return;
+        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![j isKindOfClass:[NSDictionary class]]) return;
+        NSString *tid = j[@"themeID"], *iv = j[@"iv"], *k = j[@"key"], *nm = j[@"name"];
+        if (!tid || !iv || !k) return;
+        NSString *line = [NSString stringWithFormat:@"%@\t%@\t%@\t%@\n", tid, iv, k, nm ?: @""];
+        NSString *fp = [Dir() stringByAppendingPathComponent:@"keys_found.tsv"];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:fp];
+        if (!fh) [line writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        gKeysFound++;
+        LogLine(@"★★ 记录密钥 #%d  %@  iv=%@  key=%@  (%@)", gKeysFound, tid, iv, k, nm ?: @"");
+    } @catch (NSException *e) { }
+}
+
 static int my_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
                       const void *key, size_t keyLen, const void *iv,
                       const void *in, size_t inLen, void *out, size_t outAvail, size_t *moved) {
@@ -274,6 +509,9 @@ static int my_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
             NSString *t = [[NSString alloc] initWithBytes:in length:inLen encoding:NSUTF8StringEncoding];
             LogLine(@"   [输入全文 %zuB] %@", inLen, t ? t : HexStr(in, inLen, 512));
         }
+        if (inLen >= 200 && inLen <= 300) SaveKeyPacket("ccc-in", in, inLen);
+        if ((inLen == 195 || inLen == 388 || inLen == 448) && in)
+            RecordIdentityFromPlain(in, inLen);
         if (kh.length) SaveKeyJSON(@"CCCrypt", kh, ih, keyLen, inLen, HexStr(in, 32, 32));
         if (in && inLen > 4096 && !gBigCipher) {
             gBigCipher = 1;
@@ -290,6 +528,7 @@ static int my_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
             NSString *t = [[NSString alloc] initWithBytes:out length:mv encoding:NSUTF8StringEncoding];
             LogLine(@"   [输出全文 %zuB] %@", mv, t ? t : HexStr(out, mv, 512));
         }
+        if (mv >= 200 && mv <= 300) { SaveKeyPacket("ccc-out", out, mv); RecordKeyFromPlain(out, mv); }
         if (out && mv > 4096 && !gBigPlain) {
             gBigPlain = 1;
             [[NSData dataWithBytes:out length:mv]
@@ -354,6 +593,9 @@ static void InstallCryptoHooks(void) {
         { OFF_recvfrom,      (void *)my_recvfrom,(void **)&gRecvfrom, "recvfrom" },
         { OFF_write,         (void *)my_write,   (void **)&gWrite,    "write" },
         { OFF_read,          (void *)my_read,    (void **)&gRead,     "read" },
+        { OFF_socket,        (void *)my_socket,  (void **)&gSocket,   "socket" },
+        { OFF_connect,       (void *)my_connect, (void **)&gConnect,  "connect" },
+        { OFF_close,         (void *)my_close,   (void **)&gClose,    "close" },
     };
     int n = (int)(sizeof(T) / sizeof(T[0]));
     for (int i = 0; i < n; i++) {
@@ -399,9 +641,6 @@ static NSArray<NSString *> *PluginClasses(void) {
     }
     return out;
 }
-
-static NSMutableSet *gSeen = nil;
-static void EnsureSeen(void) { if (!gSeen) gSeen = [NSMutableSet set]; }
 
 static void DumpImageDict(NSDictionary *map, NSString *tag) {
     @try {
@@ -524,15 +763,82 @@ static void MarkDone(NSString *theme) {
     } @catch (NSException *e) { }
 }
 
+// ============================================================ 收据批量（自动取密钥）
+// 插件用独立 socket 拉「收据」(= 密钥包)，HTTP 层钩子看不到。
+// 但我们不需要看网络：直接调用插件自己的 fetchAndSaveReceiptForTheme: 让它去取。
+
+static id FindReceiptTarget(void) {
+    SEL sel = @selector(fetchAndSaveReceiptForTheme:);
+    if (gCfg && [gCfg respondsToSelector:sel]) return gCfg;
+    for (NSString *cn in PluginClasses()) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        if (!class_getInstanceMethod(c, sel)) continue;
+        id inst = nil;
+        @try { inst = [[c alloc] init]; } @catch (NSException *e) { }
+        if (inst) { LogLine(@"收据目标类: %@", cn); return inst; }
+    }
+    return nil;
+}
+
+static void RunReceipts(void) {
+    @try {
+        NSString *lp = @"/var/mobile/Media/km_codes.txt";
+        NSString *txt = [NSString stringWithContentsOfFile:lp encoding:NSUTF8StringEncoding error:nil];
+        if (!txt) { LogLine(@"收据批量：缺少 %@（需要它才有主题清单）", lp); return; }
+        SEL sel = @selector(fetchAndSaveReceiptForTheme:);
+        id tgt = FindReceiptTarget();
+        if (!tgt) { LogLine(@"收据批量：找不到实现 fetchAndSaveReceiptForTheme: 的对象"); return; }
+        Method m = class_getInstanceMethod([tgt class], sel);
+        if (!m) { LogLine(@"收据批量：拿不到 Method"); return; }
+        IMP imp = method_getImplementation(m);
+        LogLine(@"收据批量：目标 %@  方法 %p", NSStringFromClass([tgt class]), (void *)imp);
+
+        NSString *dp = [Dir() stringByAppendingPathComponent:@"_rcpt_done.txt"];
+        NSMutableSet *done = [NSMutableSet set];
+        for (NSString *l in [[NSString stringWithContentsOfFile:dp encoding:NSUTF8StringEncoding error:nil]
+                             componentsSeparatedByString:@"\n"])
+            if (l.length > 3) [done addObject:l];
+        NSArray *rows = [txt componentsSeparatedByString:@"\n"];
+        LogLine(@"收据批量：清单 %lu 行，已完成 %lu", (unsigned long)rows.count, (unsigned long)done.count);
+
+        int n = 0, limit = 2500;
+        for (NSString *row in rows) {
+            if (row.length < 6) continue;
+            NSString *code = [[row componentsSeparatedByString:@"\t"] firstObject];
+            if (!code || code.length < 6 || [done containsObject:code]) continue;
+            @try {
+                ((void (*)(id, SEL, id))imp)(tgt, sel, code);
+                n++;
+                NSData *d = [[code stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:dp];
+                if (!fh) [d writeToFile:dp atomically:YES];
+                else { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
+                if (n % 5 == 0)
+                    LogLine(@"收据进度 %d  当前 %@  累计密钥 %d", n, code, gKeysFound);
+                // ★ 每 25 个一批，批末等 1 秒 —— 把 90 分钟压到约 4 分钟
+                if (n % 25 == 0) [NSThread sleepForTimeInterval:1.0];
+            } @catch (NSException *e) { LogLine(@"收据异常 %@ : %@", code, e); }
+            if (n >= limit) { LogLine(@"本轮达上限 %d，下轮继续", limit); break; }
+        }
+        LogLine(@"收据批量结束：本轮 %d，累计密钥 %d", n, gKeysFound);
+    } @catch (NSException *e) { LogLine(@"收据批量异常 %@", e); }
+}
+
 static void RunBulk(void) {
     @try {
         if (!gCfg || !gLoadIMP) { LogLine(@"批量：还没拿到插件入口，跳过"); return; }
         NSFileManager *fm = [NSFileManager defaultManager];
         NSMutableArray<NSString *> *roots = [NSMutableArray array];
-        NSString *r1 = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ThemeApp/KmTheme"];
-        if ([fm fileExistsAtPath:r1]) [roots addObject:r1];
-        NSString *r2 = @"/var/mobile/Media/km_bulk";
-        if ([fm fileExistsAtPath:r2]) [roots addObject:r2];
+        NSArray *cands = @[
+            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ThemeApp/KmTheme"],
+            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ThemeApp/KmBubble"],
+            @"/var/mobile/Media/km_bulk",
+            @"/var/mobile/Media/km_bulk/KmTheme",
+            @"/var/mobile/Media/km_bulk/KmBubble",
+        ];
+        for (NSString *c in cands)
+            if ([fm fileExistsAtPath:c]) [roots addObject:c];
         if (!roots.count) { LogLine(@"批量：没找到主题目录"); return; }
 
         NSMutableArray<NSString *> *todo = [NSMutableArray array];
@@ -544,9 +850,10 @@ static void RunBulk(void) {
                                  stringByAppendingPathComponent:@"keiembox.dat"];
                 if ([fm fileExistsAtPath:dat] && ![done containsObject:name]) [todo addObject:name];
             }
-        LogLine(@"批量：已完成 %lu，待处理 %lu", (unsigned long)done.count, (unsigned long)todo.count);
+        LogLine(@"批量：已完成 %lu，待处理 %lu（目录 %lu 个）",
+                (unsigned long)done.count, (unsigned long)todo.count, (unsigned long)roots.count);
         if (!todo.count) return;
-        int ok = 0, fail = 0;
+        int ok = 0, fail = 0, kp0 = gKpCount;
         for (NSString *name in todo) {
             @autoreleasepool {
                 NSString *dat = nil;
@@ -560,13 +867,15 @@ static void RunBulk(void) {
                     gLoadIMP(gCfg, gLoadSEL, dat);
                     int n = DumpThemeMap(gCfg, name);
                     if (n > 0) { MarkDone(name); ok++; } else fail++;
-                    if ((ok + fail) % 5 == 0)
-                        LogLine(@"批量进度 %d/%lu 成功 %d 失败 %d",
-                                ok + fail, (unsigned long)todo.count, ok, fail);
+                    if ((ok + fail) % 10 == 0)
+                        LogLine(@"批量进度 %d/%lu 成功 %d 失败 %d 新密钥包 %ld",
+                                ok + fail, (unsigned long)todo.count, ok, fail,
+                                (long)(gKpCount - kp0));
                 } @catch (NSException *e) { fail++; }
             }
         }
-        LogLine(@"批量结束：成功 %d 失败 %d", ok, fail);
+        LogLine(@"批量结束：成功 %d 失败 %d 本轮新增密钥包 %ld", ok, fail,
+                (long)(gKpCount - kp0));
     } @catch (NSException *e) { LogLine(@"批量异常 %@", e); }
 }
 
@@ -607,14 +916,17 @@ static int InstallLoader(void) {
                     if (n) {
                         MarkDone(tn);
                         LogLine(@"★ 本主题收割完成：%d 个原版文件 -> KM/%@/", n, tn);
-                        static volatile int bs = 0;
-                        if (!bs) {
-                            bs = 1;
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
-                                dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                                    @autoreleasepool { RunBulk(); }
-                                });
-                        }
+                    }
+                } @catch (NSException *e) { }
+                // ★★ 关键：一拿到插件对象就立刻开始批量取收据（不依赖后台定时器）
+                @try {
+                    static volatile int rp = 0;
+                    if (!rp) {
+                        rp = 1;
+                        LogLine(@"★★ 插件对象已就位，立刻启动收据批量");
+                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                            @autoreleasepool { RunReceipts(); }
+                        });
                     }
                 } @catch (NSException *e) { }
                 @try {
@@ -723,6 +1035,153 @@ static void HookClass(Class c, SEL sel, IMP repl) {
     [gSeen addObject:idk];
     method_setImplementation(m, repl);
     LogLine(@"  net 挂钩 +[%@ %@]", NSStringFromClass(c), NSStringFromSelector(sel));
+}
+
+static NSArray<NSString *> *PluginClasses(void);   // 前向声明（定义在后面）
+
+// ============================================================ 信封 / 签名 / 收据 全量抓取
+// 目标：把「接口名(context) + 业务参数 + 待签名串 + 签名 + 信封密文」全记下来
+//      这样就能在 PC 上完整复现请求，不需要手机参与
+
+static BOOL SeenOnce(NSString *key) {
+    EnsureSeen();
+    if ([gSeen containsObject:key]) return NO;
+    [gSeen addObject:key];
+    return YES;
+}
+
+static void InstallEnvelopeHooks(void) {
+    SEL s1 = NSSelectorFromString(@"encryptedEnvelopeWithBusinessParams:context:error:");
+    SEL s2 = NSSelectorFromString(@"decryptResponseEnvelope:context:error:");
+    SEL s3 = NSSelectorFromString(@"signCanonicalString:derivedKey:");
+    SEL s4 = NSSelectorFromString(@"canonicalStringWithData:dev:ek:iv:nonce:ts:sessionKey:");
+    SEL s5 = NSSelectorFromString(@"fetchAndSaveReceiptForTheme:");
+    SEL s6 = NSSelectorFromString(@"verifySign:canonical:derivedKey:");
+
+    NSArray *all = PluginClasses();
+    LogLine(@"信封钩子：扫描 %lu 个插件类", (unsigned long)all.count);
+    int nFound = 0;
+
+    for (NSString *cn in all) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+
+        // ① 构造加密信封：context 就是接口名
+        Method m1 = class_getInstanceMethod(c, s1);
+        if (m1) {
+            IMP o1 = method_getImplementation(m1);
+            if (SeenOnce([NSString stringWithFormat:@"H1:%p", o1])) {
+                method_setImplementation(m1, imp_implementationWithBlock(^id(id me, id p, id ctx, void *err) {
+                    @try {
+                        LogLine(@"[ENV-OUT] %@  context=%@", cn, ctx);
+                        LogLine(@"   params = %@", p);
+                    } @catch (NSException *e) { }
+                    id r = ((id (*)(id, SEL, id, id, void *))o1)(me, s1, p, ctx, err);
+                    @try { LogLine(@"   envelope = %@", r); } @catch (NSException *e) { }
+                    return r;
+                }));
+                nFound++;
+                LogLine(@"  ✓ %@ encryptedEnvelope...", cn);
+            }
+        }
+
+        // ② 解密响应信封：context 同样是接口名
+        Method m2 = class_getInstanceMethod(c, s2);
+        if (m2) {
+            IMP o2 = method_getImplementation(m2);
+            if (SeenOnce([NSString stringWithFormat:@"H2:%p", o2])) {
+                method_setImplementation(m2, imp_implementationWithBlock(^id(id me, id env, id ctx, void *err) {
+                    @try { LogLine(@"[ENV-IN ] %@  context=%@  env=%@", cn, ctx, env); }
+                    @catch (NSException *e) { }
+                    id r = ((id (*)(id, SEL, id, id, void *))o2)(me, s2, env, ctx, err);
+                    @try { LogLine(@"   resp = %@", r); } @catch (NSException *e) { }
+                    return r;
+                }));
+                nFound++;
+                LogLine(@"  ✓ %@ decryptResponseEnvelope...", cn);
+            }
+        }
+
+        // ③ 签名核心：待签名串 + 派生密钥 + 结果
+        Method m3 = class_getInstanceMethod(c, s3);
+        if (m3) {
+            IMP o3 = method_getImplementation(m3);
+            if (SeenOnce([NSString stringWithFormat:@"H3:%p", o3])) {
+                method_setImplementation(m3, imp_implementationWithBlock(^id(id me, id canon, id dk) {
+                    id r = nil;
+                    @try {
+                        r = ((id (*)(id, SEL, id, id))o3)(me, s3, canon, dk);
+                        LogLine(@"[SIGN] canonical=%@  derivedKey=%@  → sign=%@", canon, dk, r);
+                    } @catch (NSException *e) { }
+                    return r;
+                }));
+                nFound++;
+                LogLine(@"  ✓ %@ signCanonicalString:derivedKey:", cn);
+            }
+        }
+
+        // ④ 待签名串构造：所有输入都在这
+        Method m4 = class_getInstanceMethod(c, s4);
+        if (m4) {
+            IMP o4 = method_getImplementation(m4);
+            if (SeenOnce([NSString stringWithFormat:@"H4:%p", o4])) {
+                method_setImplementation(m4, imp_implementationWithBlock(
+                    ^id(id me, id data, id dev, id ek, id iv, id nonce, id ts, id sk) {
+                    id r = nil;
+                    @try {
+                        r = ((id (*)(id, SEL, id, id, id, id, id, id, id))o4)(
+                                me, s4, data, dev, ek, iv, nonce, ts, sk);
+                        LogLine(@"[CANON] data=%@ dev=%@ ek=%@ iv=%@ nonce=%@ ts=%@ sk=%@",
+                                data, dev, ek, iv, nonce, ts, sk);
+                        LogLine(@"   canonical = %@", r);
+                    } @catch (NSException *e) { }
+                    return r;
+                }));
+                nFound++;
+                LogLine(@"  ✓ %@ canonicalStringWithData:...", cn);
+            }
+        }
+
+        // ⑤ 收据获取：这是拿密钥的入口
+        Method m5 = class_getInstanceMethod(c, s5);
+        if (m5) {
+            IMP o5 = method_getImplementation(m5);
+            if (SeenOnce([NSString stringWithFormat:@"H5:%p", o5])) {
+                method_setImplementation(m5, imp_implementationWithBlock(^id(id me, id themeID) {
+                    @try { LogLine(@"[RECEIPT] %@  themeID=%@", cn, themeID); }
+                    @catch (NSException *e) { }
+                    id r = nil;
+                    @try { r = ((id (*)(id, SEL, id))o5)(me, s5, themeID); } @catch (NSException *e) { }
+                    @try { LogLine(@"[RECEIPT] themeID=%@ 返回 %@", themeID, r); }
+                    @catch (NSException *e) { }
+                    return r;
+                }));
+                nFound++;
+                LogLine(@"  ✓ %@ fetchAndSaveReceiptForTheme:  ← 关键", cn);
+            }
+        }
+
+        // ⑥ 签名校验：能看出它比对什么
+        Method m6 = class_getInstanceMethod(c, s6);
+        if (m6) {
+            IMP o6 = method_getImplementation(m6);
+            if (SeenOnce([NSString stringWithFormat:@"H6:%p", o6])) {
+                method_setImplementation(m6, imp_implementationWithBlock(^BOOL(id me, id sig, id canon, id dk) {
+                    BOOL r = NO;
+                    @try {
+                        r = ((BOOL (*)(id, SEL, id, id, id))o6)(me, s6, sig, canon, dk);
+                        LogLine(@"[VERIFY] sig=%@ canonical=%@ dk=%@ → %d", sig, canon, dk, (int)r);
+                    } @catch (NSException *e) { }
+                    return r;
+                }));
+                nFound++;
+                LogLine(@"  ✓ %@ verifySign:canonical:derivedKey:", cn);
+            }
+        }
+    }
+    LogLine(@">>> 信封钩子结果：成功挂钩 %d 个方法", nFound);
+    if (nFound == 0)
+        LogLine(@">>> !! 一个都没挂上：插件类可能还没加载完，下一轮会再试");
 }
 
 static void InstallNetworkLogger(void) {
@@ -981,9 +1440,10 @@ static void InstallNetworkLogger(void) {
 
 static void InstallAll(int round) {
     @autoreleasepool {
-        LogLine(@"socket 计数: send=%ld sendto=%ld recv=%ld recvfrom=%ld write=%ld read=%ld HTTP=%ld",
-                gNsend, gNsendto, gNrecv, gNrecvfrom, gNwrite, gNread, gNhttp);
-        @try { if (round == 1) InstallNetworkLogger(); } @catch (NSException *e) { }
+        LogLine(@"socket 计数: send=%ld sendto=%ld recv=%ld recvfrom=%ld write=%ld read=%ld HTTP=%ld CONN=%ld RAW=%d 密钥=%d",
+                gNsend, gNsendto, gNrecv, gNrecvfrom, gNwrite, gNread, gNhttp, gNconn, gRawBytes, gKeysFound);
+        @try { if (round == 1) { InstallNetworkLogger(); InstallFileHooks(); } } @catch (NSException *e) { }
+        @try { InstallEnvelopeHooks(); } @catch (NSException *e) { }
         @try { InstallCryptoHooks(); } @catch (NSException *e) { }
         @try { int n = InstallLoader(); if (n) LogLine(@"第 %d 轮：loader 挂钩 %d 个", round, n); }
         @catch (NSException *e) { }
@@ -996,8 +1456,19 @@ __attribute__((constructor))
 static void InitDump(void) {
     @autoreleasepool {
         (void)Dir();
-        LogLine(@"========== DumpKeiem v9 启动 ==========");
+        // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
+        LogLine(@"############################################################");
+        LogLine(@"##########  DumpKeiem v22  BUILD-C2  2026-10-16  ###########");
+        LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
+        LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
+        // 额外写一份版本标记到稳定位置，方便确认
+        @try {
+            NSString *tag = @"DumpKeiem v22 BUILD-C2\n";
+            for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
+                                  [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
+                [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } @catch (NSException *e) { }
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             double marks[] = {1, 3, 6, 12, 25, 45, 80};
             double prev = 0;
@@ -1009,6 +1480,20 @@ static void InitDump(void) {
             }
             LogLine(@"初始化流程结束");
             @try { RunBulk(); } @catch (NSException *e) { }
+            // ★ 等插件对象出现（最多 120 秒）—— 打开主题商店它就出现，随即开跑
+            for (int w = 0; w < 60; w++) {
+                if (gCfg) break;
+                if (w % 5 == 0) LogLine(@"等待插件对象… %d 秒（请打开主题商店）", w * 2);
+                [NSThread sleepForTimeInterval:2.0];
+            }
+            if (!gCfg) {
+                LogLine(@"!!! 始终没拿到插件对象 —— 必须打开一次主题商店，前台停留 1 分钟");
+            } else {
+                LogLine(@"插件对象已就位，开始收据批量");
+                @try { RunReceipts(); } @catch (NSException *e) { }
+                @try { RunBulk(); } @catch (NSException *e) { }
+            }
+            LogLine(@"流程结束（累计密钥 %d）", gKeysFound);
         });
     }
 }
