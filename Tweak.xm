@@ -983,6 +983,29 @@ static int InstallLoader(void) {
                 LogLine(@"loader 挂钩 -[%@ %@]（收据入口）", cn, @"fetchAndSaveReceiptForTheme:");
             }
         }
+        // ★ 钩 socketDidDisconnect:withError: —— 卡密认证走 socket，启动后必触发，能抓到对象
+        SEL sd = NSSelectorFromString(@"socketDidDisconnect:withError:");
+        Method dm = class_getInstanceMethod(c, sd);
+        if (dm) {
+            IMP dorig = method_getImplementation(dm);
+            NSString *idk = [NSString stringWithFormat:@"S:%s|%p", sel_getName(sd), dorig];
+            if (![gSeen containsObject:idk]) {
+                [gSeen addObject:idk];
+                SEL cs = sd;
+                IMP dr = imp_implementationWithBlock(^void(id me, id sock, id err) {
+                    @autoreleasepool {
+                        if (me && !gCfg) {
+                            gCfg = me;
+                            LogLine(@"socket 回调捕获插件对象 %@", NSStringFromClass([me class]));
+                        }
+                    }
+                    ((void(*)(id, SEL, id, id))dorig)(me, cs, sock, err);
+                });
+                method_setImplementation(dm, dr);
+                done++;
+                LogLine(@"loader 挂钩 -[%@ %@]（socket 回调）", cn, @"socketDidDisconnect:withError:");
+            }
+        }
     }
     return done;
 }
