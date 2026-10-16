@@ -1,13 +1,13 @@
-// Tweak.xm —— DumpKeiem
-// 作用：在 ThemeBox / KeiEm 插件解密主题资源的那一刻，把【解密后的容器】和【key / iv】
-//      直接写到 /var/mobile/Media/keiem_dump/，之后用 Filza 拿出来即可离线批量处理。
+// Tweak.xm —— DumpKeiem v3
+// 目的：在插件解密 keiembox.dat 时抓到 key/iv，并顺手导出解密后的原版 UIImage。
 //
-// 特点：
-//   - 不依赖任何硬编码地址：运行时遍历所有 ObjC 类，按方法名找，只钩插件自己镜像里的类
-//   - 直接钩 AES 包装方法（参数本身就是 key / iv）和两个解密结果加载方法
-//   - 全程 @try/@catch，出错绝不影响微信
+// v3 相对 v2 的三个关键改动：
+//   ① 不再全类扫描（v2 每次枚举 12 万个类，慢），改为 objc_copyClassNamesForImage 只枚举插件镜像；
+//   ② 全部动作跑在后台队列，绝不阻塞主线程；
+//   ③ 【核心】自实现 mini-fishhook：解析插件镜像的 dyld bind 表，把 CCCrypt 的调用槽换成我们的函数。
+//      插件的 AES 方法名是运行时动态注册的，按名字找不到；但 CCCrypt 是 C 函数，绕不过去。
 //
-// 用法：装好后重启微信 → 在插件里【切到另一个主题】→ 去 Filza 拿文件
+// 输出目录：优先 /var/mobile/Media/keiem_dump，写不进去回退到 app 的 Documents/keiem_dump
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -16,21 +16,22 @@
 #import <dispatch/dispatch.h>
 #import <stdlib.h>
 #import <string.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 
-#define kDirMedia @"/var/mobile/Media/keiem_dump"
+#define PLUGIN_HINT "NewMessageRingUtil"
+#define kDirMedia  @"/var/mobile/Media/keiem_dump"
 
-// ---------------- 工具 ----------------
+// ============================================================ 目录与日志
 
-static NSString *gDir = nil;    // 实际可写的输出目录
-static NSString *gLog = nil;    // log.txt 路径
+static NSString *gDir = nil, *gLog = nil;
 
-/// 优先写沙盒外的 Media（Filza 好找）；写不进去（被沙盒拦）就回退到 app 自己的 Documents
 static NSString *Dir(void) {
     if (gDir) return gDir;
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *e = nil;
     if ([fm createDirectoryAtPath:kDirMedia withIntermediateDirectories:YES attributes:nil error:&e]) {
-        NSString *t = [kDirMedia stringByAppendingPathComponent:@".wtest"];
+        NSString *t = [kDirMedia stringByAppendingPathComponent:@".w"];
         if ([@"x" writeToFile:t atomically:YES encoding:NSUTF8StringEncoding error:&e]) {
             [fm removeItemAtPath:t error:nil];
             gDir = kDirMedia;
@@ -48,8 +49,6 @@ static NSString *LogPath(void) {
     if (!gLog) gLog = [Dir() stringByAppendingPathComponent:@"log.txt"];
     return gLog;
 }
-
-static void EnsureDir(void) { (void)Dir(); }
 
 static void LogLine(NSString *fmt, ...) {
     @try {
@@ -70,336 +69,446 @@ static void LogLine(NSString *fmt, ...) {
     } @catch (NSException *e) { }
 }
 
-static NSString *HexOf(NSData *d, NSUInteger max) {
-    if (!d || d.length == 0) return @"";
-    NSUInteger n = MIN(d.length, max);
-    const uint8_t *b = (const uint8_t *)d.bytes;
-    NSMutableString *s = [NSMutableString stringWithCapacity:n * 2];
-    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
+static NSString *HexStr(const void *p, size_t n, size_t max) {
+    if (!p || !n) return @"";
+    size_t m = n < max ? n : max;
+    const uint8_t *b = (const uint8_t *)p;
+    NSMutableString *s = [NSMutableString stringWithCapacity:m * 2];
+    for (size_t i = 0; i < m; i++) [s appendFormat:@"%02x", b[i]];
     return s;
 }
 
-static NSString *Describe(id o, NSData **payloadOut) {
-    if (!o || o == [NSNull null]) return @"nil";
-    @try {
-        if ([o isKindOfClass:[NSData class]]) {
-            NSData *d = (NSData *)o;
-            if (d.length > 4096 && payloadOut && !*payloadOut) *payloadOut = d;
-            return [NSString stringWithFormat:@"NSData(%lu) hex=%@",
-                    (unsigned long)d.length, HexOf(d, 48)];
-        }
-        if ([o isKindOfClass:[NSString class]]) {
-            NSString *s = (NSString *)o;
-            NSData *utf = [s dataUsingEncoding:NSUTF8StringEncoding];
-            // 看起来像 16/24/32/64 字符的可打印串 -> 也当可疑密钥记下
-            if (s.length >= 16 && s.length <= 128) return [NSString stringWithFormat:@"NSString(\"%s\")", s.UTF8String];
-            return [NSString stringWithFormat:@"NSString(%lu) hex=%@",
-                    (unsigned long)utf.length, HexOf(utf, 48)];
-        }
-        return [NSString stringWithFormat:@"<%@ %p>", NSStringFromClass([o class]), o];
-    } @catch (NSException *e) { return @"<err>"; }
+// ============================================================ mini-fishhook
+// 只依赖 <mach-o/loader.h>，不需要 substrate / ellekit。
+
+typedef struct { const char *name; void *repl; void **orig; int hits; } RebindItem;
+
+static uint64_t rd_uleb(const uint8_t **pp) {
+    uint64_t v = 0; int sh = 0; uint8_t c;
+    do { c = **pp; (*pp)++; v |= ((uint64_t)(c & 0x7F)) << sh; sh += 7; } while ((c & 0x80) && sh < 64);
+    return v;
+}
+static int64_t rd_sleb(const uint8_t **pp) {
+    int64_t v = 0; int sh = 0; uint8_t c;
+    do { c = **pp; (*pp)++; v |= ((int64_t)(c & 0x7F)) << sh; sh += 7; } while ((c & 0x80) && sh < 64);
+    if (sh < 64 && (c & 0x40)) v |= -((int64_t)1 << sh);
+    return v;
+}
+static const char *rd_cstr(const uint8_t **pp) {
+    const char *s = (const char *)*pp;
+    while (**pp) (*pp)++;
+    (*pp)++;
+    return s;
 }
 
-static NSString *Stamp(void) {
-    static int n = 0;
-    return [NSString stringWithFormat:@"%d_%d", (int)[[NSDate date] timeIntervalSince1970], n++];
-}
+/// 在指定镜像里，把 items 里列出的符号的调用槽换成新实现（保存原实现）
+static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *items, int n) {
+    if (!mh || mh->magic != MH_MAGIC_64) return 0;
 
-static void DumpThing(NSString *where, NSArray *args) {
-    @try {
-        EnsureDir();
-        NSMutableString *sum = [NSMutableString string];
-        [sum appendFormat:@"\n==== %@ ====\n%@\n", where, [NSDate date]];
-        NSData *payload = nil;
-        NSMutableArray *maybeKey = [NSMutableArray array];
+    const struct dyld_info_command *dyld = NULL;
+    const struct segment_command_64 *segs[32];
+    int nsegs = 0;
 
-        for (NSUInteger i = 0; i < args.count; i++) {
-            NSString *d = Describe(args[i], &payload);
-            [sum appendFormat:@"  arg[%lu] %@\n", (unsigned long)i, d];
-            id o = args[i];
-            if ([o isKindOfClass:[NSString class]]) {
-                NSString *s = (NSString *)o;
-                if (s.length >= 16 && s.length <= 128 && ![s containsString:@" "])
-                    [maybeKey addObject:s];
-            } else if ([o isKindOfClass:[NSData class]] && [(NSData *)o length] == 16) {
-                [maybeKey addObject:HexOf((NSData *)o, 16)];
+    const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_DYLD_INFO_ONLY || lc->cmd == LC_DYLD_INFO)
+            dyld = (const struct dyld_info_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 && nsegs < 32)
+            segs[nsegs++] = (const struct segment_command_64 *)lc;
+        if (lc->cmdsize == 0) break;
+        p += lc->cmdsize;
+    }
+    if (!dyld) return 0;
+
+    int total = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t off  = pass ? dyld->lazy_bind_off : dyld->bind_off;
+        uint32_t size = pass ? dyld->lazy_bind_size : dyld->bind_size;
+        if (!off || !size) continue;
+
+        const uint8_t *d = (const uint8_t *)mh + off;
+        const uint8_t *end = d + size;
+        int seg = 0;
+        uint64_t seg_off = 0;
+        const char *symname = NULL;
+        int stop = 0;
+
+        while (d < end && !stop) {
+            uint8_t b = *d++;
+            uint8_t op = b & 0xF0, imm = b & 0x0F;
+            switch (op) {
+                case BIND_OPCODE_DONE:
+                    if (pass) { symname = NULL; seg_off = 0; }   // lazy：一条一 DONE
+                    else stop = 1;
+                    break;
+                case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: break;
+                case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB: rd_uleb(&d); break;
+                case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM: break;
+                case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: symname = rd_cstr(&d); break;
+                case BIND_OPCODE_SET_TYPE_IMM: break;
+                case BIND_OPCODE_SET_ADDEND_SLEB: rd_sleb(&d); break;
+                case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: seg = imm; seg_off = rd_uleb(&d); break;
+                case BIND_OPCODE_ADD_ADDR_ULEB: seg_off += rd_uleb(&d); break;
+                case BIND_OPCODE_ADD_ADDR_IMM_SCALED: seg_off += (uint64_t)imm * 8; break;
+
+                case BIND_OPCODE_DO_BIND:
+                case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+                case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+                case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB: {
+                    uint64_t times = 1, skip = 0;
+                    if (op == BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB) {
+                        times = rd_uleb(&d);
+                        skip  = rd_uleb(&d);
+                    }
+                    if (symname && seg >= 0 && seg < nsegs) {
+                        for (uint64_t t = 0; t < times; t++) {
+                            uintptr_t slot = (uintptr_t)mh + slide
+                                           + segs[seg]->vmaddr + seg_off;
+                            for (int k = 0; k < n; k++) {
+                                if (items[k].hits) continue;
+                                if (strcmp(symname, items[k].name) != 0) continue;
+                                void **pp = (void **)slot;
+                                void *cur = *pp;
+                                if (!cur) continue;
+                                if (items[k].orig) *items[k].orig = cur;
+                                *pp = items[k].repl;
+                                items[k].hits++;
+                                total++;
+                                LogLine(@"重绑定 %s  槽=%p  原=%p", items[k].name, (void *)slot, cur);
+                            }
+                            seg_off += 8 + skip;
+                        }
+                    }
+                    if (op == BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB) seg_off += rd_uleb(&d);
+                    else if (op == BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED) seg_off += (uint64_t)imm * 8;
+                    break; }
+
+                default:
+                    stop = 1;
+                    break;
             }
         }
+    }
+    return total;
+}
 
-        if (maybeKey.count) {
-            [sum appendFormat:@"  >> 可疑密钥/IV: %@\n", [maybeKey componentsJoinedByString:@"  |  "]];
+// ============================================================ CCCrypt 替换
+
+typedef int (*CCCrypt_t)(uint32_t op, uint32_t alg, uint32_t options,
+                        const void *key, size_t keyLen, const void *iv,
+                        const void *in, size_t inLen,
+                        void *out, size_t outAvail, size_t *moved);
+typedef int (*CCCryptorCreate_t)(uint32_t op, uint32_t alg, uint32_t options,
+                                const void *key, size_t keyLen, const void *iv, void **ref);
+
+static CCCrypt_t gCCCrypt = NULL;
+static CCCryptorCreate_t gCryptorCreate = NULL, gCryptorCreateWithMode = NULL;
+
+static void NoteKey(const char *who, const void *key, size_t keyLen, const void *iv,
+                    const void *in, size_t inLen) {
+    NSString *kh = HexStr(key, keyLen, 64);
+    NSString *ih = HexStr(iv, 16, 16);
+    if (!kh.length) return;
+    LogLine(@"=== %s 命中 === keyLen=%zu inLen=%zu", who, keyLen, inLen);
+    LogLine(@"    KEY = %@", kh);
+    LogLine(@"    IV  = %@", ih);
+    LogLine(@"    密文头 = %@", HexStr(in, 32, 32));
+    NSString *j = [NSString stringWithFormat:
+        @"{\"via\":\"%s\",\"keyHex\":\"%@\",\"ivHex\":\"%@\",\"keyLen\":%zu,\"cipherLen\":%zu,"
+         "\"cipherHead\":\"%@\"}\n", who, kh, ih, keyLen, inLen, HexStr(in, 32, 32)];
+    [j writeToFile:[Dir() stringByAppendingPathComponent:@"key.json"] atomically:YES
+          encoding:NSUTF8StringEncoding error:nil];
+}
+
+static int my_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
+                      const void *key, size_t keyLen, const void *iv,
+                      const void *in, size_t inLen, void *out, size_t outAvail, size_t *moved) {
+    @autoreleasepool { NoteKey("CCCrypt", key, keyLen, iv, in, inLen); }
+    int r = gCCCrypt ? gCCCrypt(op, alg, options, key, keyLen, iv, in, inLen, out, outAvail, moved) : -1;
+    @autoreleasepool {
+        size_t mv = moved ? *moved : 0;
+        LogLine(@"    返回 %d 明文长度 %zu 明文头 %@", r, mv, HexStr(out, mv ? mv : 32, 48));
+        if (in && inLen > 4096) {
+            [[NSData dataWithBytes:in length:inLen]
+                writeToFile:[Dir() stringByAppendingPathComponent:
+                           [NSString stringWithFormat:@"cipher_%zu.bin", inLen]] atomically:YES];
         }
-
-        // 解密后的容器（大块 NSData）单独落盘 —— 这是离线处理的关键
-        if (payload) {
-            NSString *p = [Dir() stringByAppendingPathComponent:
-                           [NSString stringWithFormat:@"payload_%@_%lu.bin", Stamp(), (unsigned long)payload.length]];
-            [payload writeToFile:p atomically:YES];
-            [sum appendFormat:@"  >> 数据落盘: %@ (%lu B)\n", p, (unsigned long)payload.length];
+        if (out && mv > 4096) {
+            [[NSData dataWithBytes:out length:mv]
+                writeToFile:[Dir() stringByAppendingPathComponent:
+                           [NSString stringWithFormat:@"plain_%zu.bin", mv]] atomically:YES];
         }
+    }
+    return r;
+}
 
-        // 追加到 log（同时保留最后一次到 last.txt，方便直接拿）
-        NSString *cur = [NSString stringWithContentsOfFile:LogPath() encoding:NSUTF8StringEncoding error:nil] ?: @"";
-        [[cur stringByAppendingString:sum] writeToFile:LogPath() atomically:YES
-                                              encoding:NSUTF8StringEncoding error:nil];
-        [sum writeToFile:[Dir() stringByAppendingPathComponent:@"last.txt"] atomically:YES
-                encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"[DumpKeiem] %@", sum);
+static int my_CCCryptorCreate(uint32_t op, uint32_t alg, uint32_t options,
+                              const void *key, size_t keyLen, const void *iv, void **ref) {
+    @autoreleasepool { NoteKey("CCCryptorCreate", key, keyLen, iv, NULL, 0); }
+    return gCryptorCreate ? gCryptorCreate(op, alg, options, key, keyLen, iv, ref) : -1;
+}
+
+static int my_CCCryptorCreateWithMode(uint32_t op, uint32_t mode, uint32_t alg, uint32_t pad,
+                                      const void *iv, const void *key, size_t keyLen,
+                                      const void *tweak, size_t tweakLen,
+                                      uint32_t numRounds, uint32_t options, void **ref) {
+    @autoreleasepool { NoteKey("CCCryptorCreateWithMode", key, keyLen, iv, NULL, 0); }
+    if (!gCryptorCreateWithMode) return -1;
+    typedef int (*T)(uint32_t, uint32_t, uint32_t, uint32_t, const void *, const void *,
+                     size_t, const void *, size_t, uint32_t, uint32_t, void **);
+    return ((T)gCryptorCreateWithMode)(op, mode, alg, pad, iv, key, keyLen, tweak, tweakLen,
+                                       numRounds, options, ref);
+}
+
+// ============================================================ 导出解密后的 UIImage（兜底）
+
+static void DumpMap(id obj, NSString *key) {
+    @try {
+        id map = nil;
+        @try { map = [obj valueForKey:key]; } @catch (NSException *e) { return; }
+        if (![map isKindOfClass:[NSDictionary class]] || ![map count]) return;
+        NSString *sub = [Dir() stringByAppendingPathComponent:@"icons"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:sub
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        int n = 0;
+        for (id k in map) {
+            id v = map[k];
+            if (![v isKindOfClass:[UIImage class]]) continue;
+            NSData *png = UIImagePNGRepresentation((UIImage *)v);
+            if (!png) continue;
+            NSString *nm = [[k description] stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+            [png writeToFile:[sub stringByAppendingPathComponent:[nm stringByAppendingString:@".png"]]
+                  atomically:YES];
+            if (++n >= 5000) break;
+        }
+        if (n) LogLine(@"  导出 %@ 图像 %d 张 -> %@", key, n, sub);
     } @catch (NSException *e) { }
 }
 
-// ---------------- 只钩插件镜像里的类 ----------------
+// ============================================================ 只枚举插件镜像的类
 
-static BOOL IsPluginClass(Class c) {
-    const char *img = class_getImageName(c);
-    if (!img) return NO;
-    return strstr(img, "NewMessageRingUtil") != NULL;
+static NSArray<NSString *> *PluginClasses(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    uint32_t nimg = _dyld_image_count();
+    for (uint32_t i = 0; i < nimg; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path || !strstr(path, PLUGIN_HINT)) continue;
+        unsigned int cnt = 0;
+        const char **names = objc_copyClassNamesForImage(path, &cnt);
+        if (!names) continue;
+        for (unsigned int k = 0; k < cnt; k++)
+            if (names[k]) [out addObject:[NSString stringWithUTF8String:names[k]]];
+        free((void *)names);
+    }
+    return out;
 }
 
-typedef id (*IMP1)(id, SEL, id);
+static NSMutableSet *gSeen = nil;
+static void EnsureSeen(void) { if (!gSeen) gSeen = [NSMutableSet set]; }
+
 typedef id (*IMP2)(id, SEL, id, id);
 typedef id (*IMP3)(id, SEL, id, id, id);
 typedef id (*IMP4)(id, SEL, id, id, id, id);
 typedef void (*IMPV1)(id, SEL, id);
 
-// 已经钩过的实现，避免重复挂钩
-static NSMutableSet *gHooked = nil;
-
-static void EnsureHooked(void) {
-    if (!gHooked) gHooked = [NSMutableSet set];
-}
-
-// 返回 void 的方法（loader 是 void，getter 是 id）—— 必须分开，否则 ARC 会误解返回值
-static BOOL ReturnsVoid(SEL sel) {
-    const char *n = sel_getName(sel);
-    return strcmp(n, "loadIconMapFromDecryptedDat:") == 0 ||
-           strcmp(n, "loadBubbleIconMapFromDecryptedDat:") == 0;
-}
-
-static BOOL HookSel(Class cls, SEL sel, int nargs) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    IMP orig = method_getImplementation(m);
-    if (!orig) return NO;
-    NSString *key = [NSString stringWithFormat:@"%s|%p", sel_getName(sel), orig];
-    if ([gHooked containsObject:key]) return NO;
-    [gHooked addObject:key];
-
-    SEL cs = sel;
-    BOOL isVoid = ReturnsVoid(sel);
-    @try {
-        if (isVoid && nargs == 1) {
-            IMP r = imp_implementationWithBlock(^void(id self, id a2) {
-                DumpThing([NSString stringWithFormat:@"-[%@ %s]", NSStringFromClass([self class]), sel_getName(cs)], @[a2 ?: [NSNull null]]);
-                ((IMPV1)orig)(self, cs, a2);
-            });
-            method_setImplementation(m, r);
-            return YES;
-        }
-        switch (nargs) {
-            case 1: {
-                IMP r = imp_implementationWithBlock(^id(id self, id a2) {
-                    DumpThing([NSString stringWithFormat:@"-[%@ %s]", NSStringFromClass([self class]), sel_getName(cs)], @[a2 ?: [NSNull null]]);
-                    return ((IMP1)orig)(self, cs, a2);
-                });
-                method_setImplementation(m, r);
-                break; }
-            case 2: {
-                IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3) {
-                    DumpThing([NSString stringWithFormat:@"-[%@ %s]", NSStringFromClass([self class]), sel_getName(cs)], @[a2 ?: [NSNull null], a3 ?: [NSNull null]]);
-                    return ((IMP2)orig)(self, cs, a2, a3);
-                });
-                method_setImplementation(m, r);
-                break; }
-            case 3: {
-                IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3, id a4) {
-                    DumpThing([NSString stringWithFormat:@"-[%@ %s]", NSStringFromClass([self class]), sel_getName(cs)], @[a2 ?: [NSNull null], a3 ?: [NSNull null], a4 ?: [NSNull null]]);
-                    return ((IMP3)orig)(self, cs, a2, a3, a4);
-                });
-                method_setImplementation(m, r);
-                break; }
-            case 4: {
-                IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3, id a4, id a5) {
-                    DumpThing([NSString stringWithFormat:@"-[%@ %s]", NSStringFromClass([self class]), sel_getName(cs)], @[a2 ?: [NSNull null], a3 ?: [NSNull null], a4 ?: [NSNull null], a5 ?: [NSNull null]]);
-                    return ((IMP4)orig)(self, cs, a2, a3, a4, a5);
-                });
-                method_setImplementation(m, r);
-                break; }
-            default: return NO;
-        }
-    } @catch (NSException *e) { return NO; }
-    return YES;
-}
-
-// 目标选择器 -> 参数个数
-static NSDictionary<NSString *, NSNumber *> *Targets(void) {
-    return @{
-        // AES 包装（3 个参数：data, key, iv）
+/// AES 包装方法（名字可能运行时才注册，所以每次 loader 命中后会重试）
+static int InstallAES(void) {
+    EnsureSeen();
+    NSDictionary *tg = @{
         @"aes256DecryptData:keyString:ivString:": @3,
         @"aes256EncryptData:keyString:ivString:": @3,
         @"aesDecryptData:keyString:iv:":          @3,
         @"aesEncryptData:keyString:iv:":          @3,
-        @"aesDecryptString:keyString:iv:":        @3,
-        @"aesEncryptString:keyString:iv:":        @3,
-        // 4 个参数
         @"aesCrypt:data:keyString:ivString:":     @4,
-        // 2 个参数
         @"hmacFromData:key:":                     @2,
-        // ★ 解密结果加载（1 个参数：解密后的容器）—— 关键
-        @"loadIconMapFromDecryptedDat:":          @1,
-        @"loadBubbleIconMapFromDecryptedDat:":    @1,
-        // 顺手（可能有原始文件名映射）
-        @"getThemeColorXMLForOriginalPath:":      @1,
-        @"getThemeColorCSSForOriginalPath:":      @1,
     };
-}
-
-// ==================== 授权绕过 ====================
-// 这些是"检查/校验"类方法：强制返回成功，并记录调用（方便回头确认哪个才是真正的门）
-// 0 = 参数个数未知，按探测到的类型走
-static NSDictionary<NSString *, NSNumber *> *BypassReturns(void) {
-    //  key: 选择器   value: 强制返回的值（对象，通常是 @YES / @1）
-    return @{
-        @"checkAuthabc":                          @YES,
-        @"verifySign:canonical:derivedKey:":      @YES,
-        @"verifyResponseSign:data:nonce:ts:sessionKey:": @YES,
-        @"isExpired":                             @NO,
-        @"validateFavoriteImageMessage:reason:":  @YES,
-    };
-}
-
-// 只记录、不改返回值（用来"看"授权链路到底调了哪些东西）
-static NSArray<NSString *> *WatchOnly(void) {
-    return @[
-        @"fetchAndSaveReceiptForTheme:",
-        @"setPendingReceiptThemeID:",
-        @"pendingReceiptThemeID",
-        @"receiptSocket",
-        @"setReceiptSocket:",
-        @"importConfigFromDictionary:",
-        @"keiEmImportBackupZip",
-        @"java_setDisplayName:",
-    ];
-}
-
-// ---------------- 强制返回 ----------------
-
-typedef BOOL (*IMP_BOOL)(id, SEL, ...);
-
-static void InstallBypass(void) {
-    NSDictionary *bp = BypassReturns();
     int done = 0;
-    int clsCount = objc_getClassList(NULL, 0);
-    if (clsCount <= 0) return;
-    Class *list = (Class *)malloc(sizeof(Class) * clsCount);
-    objc_getClassList(list, clsCount);
-    for (int i = 0; i < clsCount; i++) {
-        Class c = list[i];
-        if (!IsPluginClass(c)) continue;
+    for (NSString *cn in PluginClasses()) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        for (NSString *s in tg) {
+            SEL sel = NSSelectorFromString(s);
+            Method m = class_getInstanceMethod(c, sel);
+            if (!m) continue;
+            IMP orig = method_getImplementation(m);
+            NSString *idk = [NSString stringWithFormat:@"A:%s|%p", sel_getName(sel), orig];
+            if ([gSeen containsObject:idk]) continue;
+            [gSeen addObject:idk];
+            SEL cs = sel;
+            int na = [tg[s] intValue];
+            @try {
+                if (na == 2) {
+                    IMP r = imp_implementationWithBlock(^id(id me, id a2, id a3) {
+                        LogLine(@"=== AES -[%@ %@]  %@ | %@", NSStringFromClass([me class]),
+                                NSStringFromSelector(cs), a2, a3);
+                        return ((IMP2)orig)(me, cs, a2, a3);
+                    });
+                    method_setImplementation(m, r);
+                } else if (na == 3) {
+                    IMP r = imp_implementationWithBlock(^id(id me, id a2, id a3, id a4) {
+                        LogLine(@"=== AES -[%@ %@]", NSStringFromClass([me class]), NSStringFromSelector(cs));
+                        LogLine(@"    数据 %@", [a2 isKindOfClass:[NSData class]] ?
+                                [NSString stringWithFormat:@"NSData(%lu)", (unsigned long)[a2 length]] : a2);
+                        LogLine(@"    密钥 %@", a3);
+                        LogLine(@"    IV   %@", a4);
+                        if ([a3 isKindOfClass:[NSString class]]) {
+                            NoteKey("AES-arg", [(NSString *)a3 UTF8String], [(NSString *)a3 length],
+                                    [a4 isKindOfClass:[NSString class]] ? [(NSString *)a4 UTF8String] : NULL,
+                                    NULL, 0);
+                        } else if ([a3 isKindOfClass:[NSData class]]) {
+                            NoteKey("AES-arg", [(NSData *)a3 bytes], [(NSData *)a3 length],
+                                    [a4 isKindOfClass:[NSData class]] ? [(NSData *)a4 bytes] : NULL, NULL, 0);
+                        }
+                        return ((IMP3)orig)(me, cs, a2, a3, a4);
+                    });
+                    method_setImplementation(m, r);
+                } else if (na == 4) {
+                    IMP r = imp_implementationWithBlock(^id(id me, id a2, id a3, id a4, id a5) {
+                        LogLine(@"=== AES4 -[%@ %@] %@ | %@ | %@ | %@", NSStringFromClass([me class]),
+                                NSStringFromSelector(cs), a2, a3, a4, a5);
+                        return ((IMP4)orig)(me, cs, a2, a3, a4, a5);
+                    });
+                    method_setImplementation(m, r);
+                }
+                done++;
+                LogLine(@"AES 挂钩 -[%@ %@]", cn, s);
+            } @catch (NSException *e) { }
+        }
+    }
+    return done;
+}
+
+/// 解密加载入口：参数是 keiembox.dat 的路径；返回后内存里就有原版图了
+static int InstallLoader(void) {
+    EnsureSeen();
+    int done = 0;
+    for (NSString *cn in PluginClasses()) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        for (NSString *s in @[@"loadIconMapFromDecryptedDat:", @"loadBubbleIconMapFromDecryptedDat:"]) {
+            SEL sel = NSSelectorFromString(s);
+            Method m = class_getInstanceMethod(c, sel);
+            if (!m) continue;
+            IMP orig = method_getImplementation(m);
+            NSString *idk = [NSString stringWithFormat:@"L:%s|%p", sel_getName(sel), orig];
+            if ([gSeen containsObject:idk]) continue;
+            [gSeen addObject:idk];
+            SEL cs = sel;
+            IMP r = imp_implementationWithBlock(^void(id me, id a2) {
+                @autoreleasepool {
+                    LogLine(@"==== 加载解密 -[%@ %@] %@", NSStringFromClass([me class]),
+                            NSStringFromSelector(cs), a2);
+                    if ([a2 isKindOfClass:[NSString class]]) {
+                        NSData *raw = [NSData dataWithContentsOfFile:(NSString *)a2];
+                        LogLine(@"     磁盘文件 %lu 字节（加密态）", (unsigned long)raw.length);
+                    }
+                }
+                ((IMPV1)orig)(me, cs, a2);
+                @try { DumpMap(me, @"bgIconMap"); DumpMap(me, @"bubbleIconMap"); } @catch (NSException *e) { }
+                @try { int n = InstallAES(); if (n) LogLine(@"补挂 AES %d 个", n); } @catch (NSException *e) { }
+            });
+            method_setImplementation(m, r);
+            done++;
+            LogLine(@"loader 挂钩 -[%@ %@]", cn, s);
+        }
+    }
+    return done;
+}
+
+/// 授权绕过（有授权码时不起作用也无害；主要用来观察授权链路）
+static int InstallBypass(void) {
+    EnsureSeen();
+    NSDictionary *bp = @{
+        @"checkAuthabc":                     @YES,
+        @"verifySign:canonical:derivedKey:": @YES,
+        @"verifyResponseSign:data:nonce:ts:sessionKey:": @YES,
+        @"isExpired":                        @NO,
+    };
+    int done = 0;
+    for (NSString *cn in PluginClasses()) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
         for (NSString *s in bp) {
             SEL sel = NSSelectorFromString(s);
             Method m = class_getInstanceMethod(c, sel);
             if (!m) continue;
             IMP orig = method_getImplementation(m);
-            NSString *key = [NSString stringWithFormat:@"BP:%s|%p", sel_getName(sel), orig];
-            if ([gHooked containsObject:key]) continue;
-            [gHooked addObject:key];
-
+            NSString *idk = [NSString stringWithFormat:@"B:%s|%p", sel_getName(sel), orig];
+            if ([gSeen containsObject:idk]) continue;
+            [gSeen addObject:idk];
             id forced = bp[s];
             SEL cs = sel;
-            // 固定 4 参数签名：多余的参数被忽略，少参数时也多读无害（不取用）
-            IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3, id a4) {
+            IMP r = imp_implementationWithBlock(^id(id me, id a2, id a3, id a4) {
                 (void)a2; (void)a3; (void)a4;
-                BOOL val = [forced boolValue];
-                LogLine(@"★ 授权绕过命中: -[%@ %@] 强制返回 %@",
-                        NSStringFromClass([self class]), NSStringFromSelector(cs),
-                        val ? @"YES" : @"NO");
+                LogLine(@"★ 授权绕过 -[%@ %@] -> %@", NSStringFromClass([me class]),
+                        NSStringFromSelector(cs), [forced boolValue] ? @"YES" : @"NO");
                 return forced;
             });
             method_setImplementation(m, r);
             done++;
-            LogLine(@"bypass 挂钩 -[%@ %@]", NSStringFromClass(c), s);
         }
     }
-    free(list);
-    LogLine(@"授权绕过：挂了 %d 个方法", done);
+    return done;
 }
 
-// ---------------- 只记录 ----------------
+// ============================================================ 装载
 
-static void InstallWatch(void) {
-    NSArray *wl = WatchOnly();
-    int done = 0;
-    int clsCount = objc_getClassList(NULL, 0);
-    if (clsCount <= 0) return;
-    Class *list = (Class *)malloc(sizeof(Class) * clsCount);
-    objc_getClassList(list, clsCount);
-    for (int i = 0; i < clsCount; i++) {
-        Class c = list[i];
-        if (!IsPluginClass(c)) continue;
-        for (NSString *s in wl) {
-            SEL sel = NSSelectorFromString(s);
-            Method m = class_getInstanceMethod(c, sel);
-            if (!m) continue;
-            IMP orig = method_getImplementation(m);
-            NSString *key = [NSString stringWithFormat:@"WO:%s|%p", sel_getName(sel), orig];
-            if ([gHooked containsObject:key]) continue;
-            [gHooked addObject:key];
-            SEL cs = sel;
-            // 统一按「最多 3 个参数」包装：多余的寄存器参数不影响
-            IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3, id a4) {
-                DumpThing([NSString stringWithFormat:@"WATCH -[%@ %@]",
-                           NSStringFromClass([self class]), NSStringFromSelector(cs)],
-                          @[a2 ?: [NSNull null], a3 ?: [NSNull null], a4 ?: [NSNull null]]);
-                return ((IMP3)orig)(self, cs, a2, a3, a4);
-            });
-            method_setImplementation(m, r);
-            done++;
+static int gRebindTotal = 0;
+
+static void DoRebind(void) {
+    RebindItem items[] = {
+        { "CCCrypt",                 (void *)my_CCCrypt,         (void **)&gCCCrypt },
+        { "CCCryptorCreate",         (void *)my_CCCryptorCreate, (void **)&gCryptorCreate },
+        { "CCCryptorCreateWithMode", (void *)my_CCCryptorCreateWithMode,
+                                     (void **)&gCryptorCreateWithMode },
+    };
+    int n = (int)(sizeof(items) / sizeof(items[0]));
+    uint32_t nimg = _dyld_image_count();
+    for (uint32_t i = 0; i < nimg; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path || !strstr(path, PLUGIN_HINT)) continue;
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if ((mh->magic & 0xFFFFFFFF) == MH_MAGIC_64) {
+            int h = Rebind(mh, slide, items, n);
+            gRebindTotal += h;
         }
     }
-    free(list);
-    LogLine(@"观察点：挂了 %d 个方法", done);
 }
 
-static void InstallHooks(void) {
-    EnsureHooked();
-    NSDictionary *tg = Targets();
-    int clsCount = objc_getClassList(NULL, 0);
-    if (clsCount <= 0) return;
-    Class *list = (Class *)malloc(sizeof(Class) * clsCount);
-    objc_getClassList(list, clsCount);
-
-    int hooked = 0;
-    for (int i = 0; i < clsCount; i++) {
-        Class c = list[i];
-        if (!IsPluginClass(c)) continue;
-        for (NSString *s in tg) {
-            if (HookSel(c, NSSelectorFromString(s), [tg[s] intValue])) {
-                hooked++;
-                LogLine(@"hook %@ -[%@ %@]", @"OK", NSStringFromClass(c), s);
-            }
+static void InstallAll(int round) {
+    @autoreleasepool {
+        if (!gRebindTotal) {
+            @try { DoRebind(); } @catch (NSException *e) { LogLine(@"重绑定异常 %@", e); }
+            if (gRebindTotal)
+                LogLine(@"第 %d 轮：CCCrypt 重绑定成功（共 %d 个槽）", round, gRebindTotal);
+            else
+                LogLine(@"第 %d 轮：插件镜像还没加载 / 未找到 CCCrypt 槽", round);
         }
+        @try { int n = InstallAES();   if (n) LogLine(@"第 %d 轮：AES 挂钩 %d 个", round, n); } @catch (NSException *e) { }
+        @try { int n = InstallLoader();if (n) LogLine(@"第 %d 轮：loader 挂钩 %d 个", round, n); } @catch (NSException *e) { }
+        @try { int n = InstallBypass();if (n) LogLine(@"第 %d 轮：授权绕过 %d 个", round, n); } @catch (NSException *e) { }
     }
-    free(list);
-    LogLine(@"扫描 %d 个类，挂钩 %d 个方法（镜像 NewMessageRingUtil）", clsCount, hooked);
 }
 
 __attribute__((constructor))
 static void InitDump(void) {
     @autoreleasepool {
-        EnsureDir();
-        LogLine(@"DumpKeiem 启动，输出目录 %@", Dir());
-        // 插件可能还没加载，稍后再扫
-        for (NSNumber *delay in @[@0, @3, @8, @20, @40]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @try {
-                    InstallHooks();     // 抓取点
-                    InstallBypass();    // 授权绕过
-                    InstallWatch();     // 观察点
-                } @catch (NSException *e) { LogLine(@"扫描异常: %@", e); }
-            });
-        }
+        (void)Dir();
+        LogLine(@"========== DumpKeiem v3 启动 ==========");
+        LogLine(@"输出目录 %@", Dir());
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            double marks[] = {2, 6, 12, 25, 45, 80};
+            double prev = 0;
+            for (int i = 0; i < 6; i++) {
+                double wait = marks[i] - prev;
+                if (wait > 0) [NSThread sleepForTimeInterval:wait];
+                prev = marks[i];
+                @try { InstallAll(i + 1); } @catch (NSException *e) { }
+            }
+            LogLine(@"初始化流程结束");
+        });
     }
 }
