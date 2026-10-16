@@ -19,6 +19,8 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
+#import <sys/mman.h>
 
 #define PLUGIN_HINT "NewMessageRingUtil"
 #define kDirMedia  @"/var/mobile/Media/keiem_dump"
@@ -78,6 +80,9 @@ static NSString *HexStr(const void *p, size_t n, size_t max) {
     for (size_t i = 0; i < m; i++) [s appendFormat:@"%02x", b[i]];
     return s;
 }
+
+// 前置声明：定义在下面「安全写函数指针槽」一节
+static int SafeWriteSlot(void **slot, void *val);
 
 // ============================================================ mini-fishhook
 // 只依赖 <mach-o/loader.h>，不需要 substrate / ellekit。
@@ -191,7 +196,7 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
                                 if (!cur) continue;
                                 // 懒绑定槽里放的可能不是真函数，所以原函数优先用 dlsym 拿到的
                                 if (items[k].orig && !*items[k].orig) *items[k].orig = cur;
-                                *pp = items[k].repl;
+                                if (!SafeWriteSlot(pp, items[k].repl)) continue;
                                 items[k].hits++;
                                 total++;
                                 LogLine(@"重绑定 %s  槽=%p  原=%p", items[k].name, (void *)slot, cur);
@@ -210,6 +215,35 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
         }
     }
     return total;
+}
+
+// ============================================================ 安全写函数指针槽
+// __la_symbol_ptr / __got 一般在 __DATA_CONST 里，dyld 做完 fixup 会把整段设为只读。
+// 直接写会 EXC_BAD_ACCESS。必须先 vm_protect 把那一页改成可写（VM_PROT_COPY 走 COW，
+// 不会把共享缓存改坏）。
+
+static int SafeWriteSlot(void **slot, void *val) {
+    @try {
+        vm_address_t addr = (vm_address_t)slot;
+        vm_address_t page = addr & ~(vm_address_t)(vm_page_size - 1);
+        vm_size_t span = (vm_size_t)((addr + sizeof(void *)) - page);
+
+        kern_return_t kr = vm_protect(mach_task_self(), page, span, FALSE,
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS) {
+            kr = vm_protect(mach_task_self(), page, span, FALSE,
+                            VM_PROT_READ | VM_PROT_WRITE);
+        }
+        if (kr != KERN_SUCCESS) {
+            LogLine(@"  !! vm_protect 失败 kr=%d，跳过该槽 %p", (int)kr, (void *)slot);
+            return 0;
+        }
+        *slot = val;
+        return 1;
+    } @catch (NSException *e) {
+        LogLine(@"  !! 写槽异常 %@", e);
+        return 0;
+    }
 }
 
 // ============================================================ CCCrypt 替换
@@ -315,9 +349,11 @@ static void DumpIvars(id obj, const char *why) {
         for (unsigned int i = 0; i < cnt; i++) {
             const char *n = ivar_getName(ivs[i]);
             const char *t = ivar_getTypeEncoding(ivs[i]);
-            if (!n) continue;
+            if (!n || !t) continue;
+            // ★ 只碰对象类型。非 @ 的 ivar（BOOL/int/结构体）用 object_getIvar 解引用 → 野指针崩溃
+            if (t[0] != '@') continue;
             id v = nil;
-            @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { }
+            @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { continue; }
             if (!v) continue;
             NSUInteger len = 0;
             if ([v respondsToSelector:@selector(length)]) len = [v length];
@@ -459,6 +495,21 @@ static int HookSlotsNow(void) {
     return h;
 }
 
+// 重活只做一次、并且延后到后台队列 —— 绝不在插件的调用路径里做文件 IO / 导图
+static volatile int gDumpedOnce = 0;
+
+static void DeferredDump(id obj) {
+    if (gDumpedOnce) return;
+    gDumpedOnce = 1;
+    id strong = obj;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            @try { DumpIvars(strong, "after-load"); } @catch (NSException *e) { }
+        }
+    });
+}
+
 /// 解密加载入口：参数是 keiembox.dat 的路径；返回后内存里就有原版图了
 static int InstallLoader(void) {
     EnsureSeen();
@@ -491,7 +542,7 @@ static int InstallLoader(void) {
                     int h = HookSlotsNow();
                     if (h) LogLine(@"★ 解密后重扫槽位命中 %d 个 —— 再切一次主题即可抓到 key", h);
                 } @catch (NSException *e) { }
-                @try { DumpIvars(me, "after-load"); } @catch (NSException *e) { }
+                @try { DeferredDump(me); } @catch (NSException *e) { }
                 @try { int n = InstallAES(); if (n) LogLine(@"补挂 AES %d 个", n); } @catch (NSException *e) { }
             });
             method_setImplementation(m, r);
@@ -583,7 +634,7 @@ static int HookViaSlots(const char *sym, void *repl, void **orig) {
                     void **slot = (void **)(base + j * 8);
                     if (*slot != real) continue;
                     if (orig && !*orig) *orig = *slot;
-                    *slot = repl;
+                    if (!SafeWriteSlot(slot, repl)) continue;
                     hits++;
                     LogLine(@"  槽命中 %s  %s.%s[%zu] @%p", sym, segs[s]->segname, sec->sectname, j, (void *)slot);
                 }
