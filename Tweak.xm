@@ -767,8 +767,18 @@ static void MarkDone(NSString *theme) {
 static id FindReceiptTarget(void) {
     SEL sel = @selector(fetchAndSaveReceiptForTheme:);
     if (gCfg && [gCfg respondsToSelector:sel]) return gCfg;
-    // 不再 [[c alloc] init] —— 那会崩（插件对象必须由插件自己初始化）
-    LogLine(@"收据目标：gCfg 还没就位（请先打开一次主题商店，让插件创建对象）");
+    // 兜底：直接实例化（v24 稳定证明崩溃不是它引起的，是 socket 指针钩子）
+    for (NSString *cn in PluginClasses()) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c || !class_getInstanceMethod(c, sel)) continue;
+        id inst = nil;
+        @try { inst = [[c alloc] init]; } @catch (NSException *e) { LogLine(@"alloc init 异常 %@", e); }
+        if (inst && [inst respondsToSelector:sel]) {
+            LogLine(@"收据目标：alloc init %@", cn);
+            return inst;
+        }
+    }
+    LogLine(@"收据目标：还没拿到插件对象（请打开一次主题商店）");
     return nil;
 }
 
@@ -949,6 +959,29 @@ static int InstallLoader(void) {
             method_setImplementation(m, r);
             done++;
             LogLine(@"loader 挂钩 -[%@ %@]", cn, s);
+        }
+        // ★ 再钩 fetchAndSaveReceiptForTheme: —— 一有收据活动就捕获插件对象
+        SEL fs = NSSelectorFromString(@"fetchAndSaveReceiptForTheme:");
+        Method fm = class_getInstanceMethod(c, fs);
+        if (fm) {
+            IMP fo = method_getImplementation(fm);
+            NSString *idk = [NSString stringWithFormat:@"F:%s|%p", sel_getName(fs), fo];
+            if (![gSeen containsObject:idk]) {
+                [gSeen addObject:idk];
+                SEL cs = fs;
+                IMP fr = imp_implementationWithBlock(^void(id me, id themeID) {
+                    @autoreleasepool {
+                        if (me && !gCfg) {
+                            gCfg = me;
+                            LogLine(@"收据钩子捕获插件对象 %@", NSStringFromClass([me class]));
+                        }
+                    }
+                    ((IMPV1)fo)(me, cs, themeID);
+                });
+                method_setImplementation(fm, fr);
+                done++;
+                LogLine(@"loader 挂钩 -[%@ %@]（收据入口）", cn, @"fetchAndSaveReceiptForTheme:");
+            }
         }
     }
     return done;
@@ -1462,13 +1495,13 @@ static void InitDump(void) {
         (void)Dir();
         // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
         LogLine(@"############################################################");
-        LogLine(@"##########  DumpKeiem v24  BUILD-C3  2026-10-16  ###########");
+        LogLine(@"##########  DumpKeiem v25  BUILD-C4  2026-10-16  ###########");
         LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
         LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
         // 额外写一份版本标记到稳定位置，方便确认
         @try {
-            NSString *tag = @"DumpKeiem v24 BUILD-C3\n";
+            NSString *tag = @"DumpKeiem v25 BUILD-C4\n";
             for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
                                   [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
                 [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
