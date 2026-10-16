@@ -641,7 +641,7 @@ static void InstallNetworkLogger(void) {
                             if (s) NetLog(@"      resp: %@", [s substringToIndex:MIN((NSUInteger)1500, s.length)]);
                             else {
                                 // 二进制响应：前 64 字节 hex —— 密钥包会是 224/240 字节
-                                const uint8_t *p = d.bytes;
+                                const uint8_t *p = (const uint8_t *)d.bytes;
                                 NSMutableString *hx = [NSMutableString string];
                                 for (NSUInteger i = 0; i < MIN((NSUInteger)64, d.length); i++)
                                     [hx appendFormat:@"%02x", p[i]];
