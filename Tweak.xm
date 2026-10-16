@@ -217,6 +217,146 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
     return total;
 }
 
+// ============================================================ 主题原版素材收割
+// 关键发现：插件自己解密，把结果放进 _themeMap 字典 —— 键就是【原始文件名】，值是解密后的 NSData。
+// 而且 loadIconMapFromDecryptedDat: 接受【任意路径】。
+//   => 我们不用密钥：让插件自己解密，我们只把 _themeMap 抄出来。
+//   => 还可以自动批量：遍历 ThemeApp/KmTheme/*/keiembox.dat，逐个调 loader，逐个抄。
+
+static id gCfg = nil;                 // 被 hook 的配置对象（插件单例）
+static SEL gLoadSEL = NULL;           // loadIconMapFromDecryptedDat:
+static void (*gLoadIMP)(id, SEL, id) = NULL;
+
+static NSString *ThemeNameFromPath(NSString *p) {
+    if (![p isKindOfClass:[NSString class]]) return @"unknown";
+    return [[p stringByDeletingLastPathComponent] lastPathComponent] ?: @"unknown";
+}
+
+static void SaveOneFile(NSString *theme, NSString *name, NSData *d) {
+    @try {
+        NSString *safe = [theme stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+        NSString *base = [[Dir() stringByAppendingPathComponent:@"KM"] stringByAppendingPathComponent:safe];
+        NSString *rel = [name stringByReplacingOccurrencesOfString:@".." withString:"_"];
+        NSString *p = [base stringByAppendingPathComponent:rel];
+        [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        [d writeToFile:p atomically:YES];
+    } @catch (NSException *e) { }
+}
+
+/// 把 _themeMap 里【每一个】文件按原始文件名落盘到 KM/<主题>/ 下
+static int DumpThemeMap(id obj, NSString *theme) {
+    int n = 0;
+    @try {
+        Class C = [obj class];
+        unsigned int cnt = 0;
+        Ivar *ivs = class_copyIvarList(C, &cnt);
+        if (!ivs) return 0;
+        for (unsigned int i = 0; i < cnt; i++) {
+            const char *in = ivar_getName(ivs[i]);
+            const char *it = ivar_getTypeEncoding(ivs[i]);
+            if (!in || !it || it[0] != '@') continue;
+            if (!strstr(in, "Map")) continue;              // 只处理 *Map 字段
+            id v = nil;
+            @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { continue; }
+            if (![v isKindOfClass:[NSDictionary class]]) continue;
+            int got = 0;
+            for (id k in (NSDictionary *)v) {
+                id vv = ((NSDictionary *)v)[k];
+                if (![vv isKindOfClass:[NSData class]]) continue;
+                if ([(NSData *)vv length] < 32) continue;
+                SaveOneFile(theme, [k description], (NSData *)vv);
+                got++;
+            }
+            if (got) LogLine(@"  >> %s 落盘 %d 个原版文件 -> KM/%@/", in, got, theme);
+            n += got;
+        }
+        free(ivs);
+    } @catch (NSException *e) { LogLine(@"  DumpThemeMap 异常 %@", e); }
+    return n;
+}
+
+/// 记录已处理过的主题，方便分批续跑
+static NSMutableSet *LoadDoneSet(void) {
+    static NSMutableSet *s = nil;
+    if (s) return s;
+    s = [NSMutableSet set];
+    NSString *p = [Dir() stringByAppendingPathComponent:@"KM/_done.txt"];
+    NSString *txt = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *l in [txt componentsSeparatedByString:@"\n"])
+        if (l.length) [s addObject:l];
+    return s;
+}
+
+static void MarkDone(NSString *theme) {
+    @try {
+        NSMutableSet *s = LoadDoneSet();
+        if ([s containsObject:theme]) return;
+        [s addObject:theme];
+        NSString *p = [Dir() stringByAppendingPathComponent:@"KM/_done.txt"];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        NSData *d = [[theme stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        if (!fh) [d writeToFile:p atomically:YES];
+        else { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
+    } @catch (NSException *e) { }
+}
+
+/// 批量收割：遍历主题目录下所有 keiembox.dat，让插件自己解密，我们把结果抄出来
+static void RunBulk(void) {
+    @try {
+        if (!gCfg || !gLoadIMP) { LogLine(@"批量：还没拿到插件入口，跳过"); return; }
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSMutableArray<NSString *> *roots = [NSMutableArray array];
+        // ① 插件已下载的主题（最常用）
+        NSString *r1 = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ThemeApp/KmTheme"];
+        if ([fm fileExistsAtPath:r1]) [roots addObject:r1];
+        // ② 手动投放的目录（方便你自己放 dat 进去）
+        NSString *r2 = @"/var/mobile/Media/km_bulk";
+        if ([fm fileExistsAtPath:r2]) [roots addObject:r2];
+        if (!roots.count) { LogLine(@"批量：没找到任何主题目录"); return; }
+
+        NSMutableArray<NSString *> *jobs = [NSMutableArray array];
+        for (NSString *root in roots) {
+            for (NSString *name in [fm contentsOfDirectoryAtPath:root error:nil]) {
+                if ([name hasPrefix:@"."] || [name isEqualToString:@"km_bulk"]) continue;
+                NSString *dat = [[root stringByAppendingPathComponent:name]
+                                 stringByAppendingPathComponent:@"keiembox.dat"];
+                if ([fm fileExistsAtPath:dat]) [jobs addObject:name];
+            }
+        }
+        NSMutableSet *done = LoadDoneSet();
+        NSMutableArray<NSString *> *todo = [NSMutableArray array];
+        for (NSString *n in jobs) if (![done containsObject:n]) [todo addObject:n];
+
+        LogLine(@"批量：共 %lu 个主题，已完成 %lu，本次待处理 %lu",
+                (unsigned long)jobs.count, (unsigned long)done.count, (unsigned long)todo.count);
+        if (!todo.count) return;
+
+        int ok = 0, fail = 0;
+        for (NSString *name in todo) {
+            NSString *dat = nil;
+            for (NSString *root in roots) {
+                NSString *c = [[root stringByAppendingPathComponent:name]
+                               stringByAppendingPathComponent:@"keiembox.dat"];
+                if ([fm fileExistsAtPath:c]) { dat = c; break; }
+            }
+            if (!dat) continue;
+            @autoreleasepool {
+                @try {
+                    gLoadIMP(gCfg, gLoadSEL, dat);          // ★ 让插件自己解密
+                    int n = DumpThemeMap(gCfg, name);       // ★ 抄出全部原版文件
+                    if (n > 0) { MarkDone(name); ok++; }
+                    else fail++;
+                    if ((ok + fail) % 5 == 0)
+                        LogLine(@"批量进度 %d/%lu  本个 %d 文件  成功 %d 失败 %d",
+                                ok + fail, (unsigned long)todo.count, n, ok, fail);
+                } @catch (NSException *e) { fail++; }
+            }
+        }
+        LogLine(@"批量结束：成功 %d，失败 %d，输出在 KM/", ok, fail);
+    } @catch (NSException *e) { LogLine(@"批量异常 %@", e); }
+}
+
 // ============================================================ 安全写函数指针槽
 // __la_symbol_ptr / __got 一般在 __DATA_CONST 里，dyld 做完 fixup 会把整段设为只读。
 // 直接写会 EXC_BAD_ACCESS。必须先 vm_protect 把那一页改成可写（VM_PROT_COPY 走 COW，
@@ -482,8 +622,8 @@ static int InstallAES(void) {
 // 前置声明：HookViaSlots 的定义在本文件靠后的「装载」段
 static int HookViaSlots(const char *sym, void *repl, void **orig);
 
-/// 只做「按值扫槽」这件事。可以在解密之后反复调用：那时懒绑定槽已被 dyld 填上真地址。
-static int HookSlotsNow(void) {
+/// 只做「按值扫槽」这件事。保留作为备用手段（当前路线已不需要它拿密钥）。
+static __attribute__((unused)) int HookSlotsNow(void) {
     void *rc = dlsym(RTLD_DEFAULT, "CCCrypt");
     if (rc && !gCCCrypt) gCCCrypt = (CCCrypt_t)rc;
     if (!gCryptorCreate) gCryptorCreate = (CCCryptorCreate_t)dlsym(RTLD_DEFAULT, "CCCryptorCreate");
@@ -536,11 +676,32 @@ static int InstallLoader(void) {
                     }
                 }
                 ((IMPV1)orig)(me, cs, a2);
-                // ★ 关键时机：原函数刚刚解密过 → dyld 已把 CCCrypt 的懒绑定槽填上真地址。
-                //   此刻按值重扫槽位必然命中；之后的每一次解密都会被我们拿到。
+                // 记住插件入口（供批量收割复用）
                 @try {
-                    int h = HookSlotsNow();
-                    if (h) LogLine(@"★ 解密后重扫槽位命中 %d 个 —— 再切一次主题即可抓到 key", h);
+                    if (!gCfg) {
+                        gCfg = me;
+                        gLoadSEL = cs;
+                        gLoadIMP = (void (*)(id, SEL, id))orig;
+                        LogLine(@"已记住插件入口，可批量收割");
+                    }
+                } @catch (NSException *e) { }
+                // ★ 核心：抄出本主题的全部原版文件（插件已解密，键就是原始文件名）
+                @try {
+                    NSString *tn = ThemeNameFromPath(a2);
+                    int n = DumpThemeMap(me, tn);
+                    if (n) {
+                        MarkDone(tn);
+                        LogLine(@"★ 本主题收割完成：%d 个原版文件 -> KM/%@/", n, tn);
+                        static volatile int bulkScheduled = 0;
+                        if (!bulkScheduled) {
+                            bulkScheduled = 1;
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                         (int64_t)(6 * NSEC_PER_SEC)),
+                                dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                                    @autoreleasepool { RunBulk(); }
+                                });
+                        }
+                    }
                 } @catch (NSException *e) { }
                 @try { DeferredDump(me); } @catch (NSException *e) { }
                 @try { int n = InstallAES(); if (n) LogLine(@"补挂 AES %d 个", n); } @catch (NSException *e) { }
