@@ -81,8 +81,34 @@ static NSString *HexStr(const void *p, size_t n, size_t max) {
     return s;
 }
 
-// 前置声明：定义在下面「安全写函数指针槽」一节
-static int SafeWriteSlot(void **slot, void *val);
+// ============================================================ 安全写函数指针槽
+// __la_symbol_ptr / __got 一般在 __DATA_CONST 里，dyld 做完 fixup 会把整段设为只读。
+// 直接写会 EXC_BAD_ACCESS。必须先 vm_protect 把那一页改成可写（VM_PROT_COPY 走 COW，
+// 不会把共享缓存改坏）。
+
+static int SafeWriteSlot(void **slot, void *val) {
+    @try {
+        vm_address_t addr = (vm_address_t)slot;
+        vm_address_t page = addr & ~(vm_address_t)(vm_page_size - 1);
+        vm_size_t span = (vm_size_t)((addr + sizeof(void *)) - page);
+
+        kern_return_t kr = vm_protect(mach_task_self(), page, span, FALSE,
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS) {
+            kr = vm_protect(mach_task_self(), page, span, FALSE,
+                            VM_PROT_READ | VM_PROT_WRITE);
+        }
+        if (kr != KERN_SUCCESS) {
+            LogLine(@"  !! vm_protect 失败 kr=%d，跳过该槽 %p", (int)kr, (void *)slot);
+            return 0;
+        }
+        *slot = val;
+        return 1;
+    } @catch (NSException *e) {
+        LogLine(@"  !! 写槽异常 %@", e);
+        return 0;
+    }
+}
 
 // ============================================================ mini-fishhook
 // 只依赖 <mach-o/loader.h>，不需要 substrate / ellekit。
@@ -357,34 +383,7 @@ static void RunBulk(void) {
     } @catch (NSException *e) { LogLine(@"批量异常 %@", e); }
 }
 
-// ============================================================ 安全写函数指针槽
-// __la_symbol_ptr / __got 一般在 __DATA_CONST 里，dyld 做完 fixup 会把整段设为只读。
-// 直接写会 EXC_BAD_ACCESS。必须先 vm_protect 把那一页改成可写（VM_PROT_COPY 走 COW，
-// 不会把共享缓存改坏）。
-
-static int SafeWriteSlot(void **slot, void *val) {
-    @try {
-        vm_address_t addr = (vm_address_t)slot;
-        vm_address_t page = addr & ~(vm_address_t)(vm_page_size - 1);
-        vm_size_t span = (vm_size_t)((addr + sizeof(void *)) - page);
-
-        kern_return_t kr = vm_protect(mach_task_self(), page, span, FALSE,
-                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-        if (kr != KERN_SUCCESS) {
-            kr = vm_protect(mach_task_self(), page, span, FALSE,
-                            VM_PROT_READ | VM_PROT_WRITE);
-        }
-        if (kr != KERN_SUCCESS) {
-            LogLine(@"  !! vm_protect 失败 kr=%d，跳过该槽 %p", (int)kr, (void *)slot);
-            return 0;
-        }
-        *slot = val;
-        return 1;
-    } @catch (NSException *e) {
-        LogLine(@"  !! 写槽异常 %@", e);
-        return 0;
-    }
-}
+// （SafeWriteSlot 已上移到 mini-fishhook 之前定义）
 
 // ============================================================ CCCrypt 替换
 
