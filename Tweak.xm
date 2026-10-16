@@ -189,12 +189,15 @@ static SockSend_t gSend = NULL, gSendto = NULL;
 static SockRecv_t gRecv = NULL, gRecvfrom = NULL;
 static IORW_t     gWrite = NULL, gRead = NULL;
 static volatile int gSockCount = 0;
+static volatile long gNsend = 0, gNsendto = 0, gNrecv = 0, gNrecvfrom = 0, gNwrite = 0, gNread = 0;
+static volatile long gNhttp = 0;
 
 static void LogWire(const char *tag, const void *buf, long len) {
     @try {
         if (gSockCount >= 400 || !buf || len <= 0) return;
         if (!LooksHTTP((const uint8_t *)buf, len)) return;
         gSockCount++;
+        gNhttp++;
         NSString *txt = [[NSString alloc] initWithBytes:buf length:MIN((long)700, len)
                                               encoding:NSUTF8StringEncoding];
         LogLine(@"[%s %ldB] %@", tag, len, txt ? txt : HexStr(buf, len, 260));
@@ -202,31 +205,37 @@ static void LogWire(const char *tag, const void *buf, long len) {
 }
 
 static long my_send(int fd, const void *buf, long len, int flags) {
+    gNsend++;
     LogWire("WIRE-OUT", buf, len);
     return gSend ? gSend(fd, buf, len, flags) : -1;
 }
 static long my_sendto(int fd, const void *buf, long len, int flags,
                       const void *addr, unsigned int alen) {
+    gNsendto++;
     LogWire("WIRE-OUT", buf, len);
     typedef long (*T)(int, const void *, long, int, const void *, unsigned int);
     return gSendto ? ((T)gSendto)(fd, buf, len, flags, addr, alen) : -1;
 }
 static long my_recv(int fd, void *buf, long len, int flags) {
+    gNrecv++;
     long r = gRecv ? gRecv(fd, buf, len, flags) : -1;
     if (r > 0) LogWire("WIRE-IN ", buf, r);
     return r;
 }
 static long my_recvfrom(int fd, void *buf, long len, int flags, void *addr, void *alen) {
+    gNrecvfrom++;
     typedef long (*T)(int, void *, long, int, void *, void *);
     long r = gRecvfrom ? ((T)gRecvfrom)(fd, buf, len, flags, addr, alen) : -1;
     if (r > 0) LogWire("WIRE-IN ", buf, r);
     return r;
 }
 static long my_write(int fd, const void *buf, long len) {
+    gNwrite++;
     if (len >= 16 && len <= 65536) LogWire("WIRE-OUT", buf, len);
     return gWrite ? gWrite(fd, buf, len) : -1;
 }
 static long my_read(int fd, void *buf, long len) {
+    gNread++;
     long r = gRead ? gRead(fd, buf, len) : -1;
     if (r >= 16 && r <= 65536) LogWire("WIRE-IN ", buf, r);
     return r;
@@ -669,10 +678,20 @@ static int InstallBypass(void) {
 
 static volatile int gNetCount = 0;
 
+// 只排除明显的系统/无关流量，其余全部记录 —— 之前过滤太严把密钥接口挡掉了
 static BOOL IsApiURL(NSString *u) {
     if (!u || u.length == 0) return NO;
-    return [u containsString:@"18179"] || [u containsString:@"api/theme"] ||
-           [u containsString:@"134.122.170.72"] || [u containsString:@"18899/upload"];
+    if ([u hasPrefix:@"file:"] || [u hasPrefix:@"data:"] || [u hasPrefix:@"about:"])
+        return NO;
+    static NSArray *noise = nil;
+    if (!noise) noise = @[@"apple.com", @"icloud", @"mzstatic", @"weixin.qq.com",
+                          @"qq.com", @"baidu.com", @"akamai", @"gstatic",
+                          @"googleapis", @"easemob", @"autonavi", @"amap.com",
+                          @"weather", @"wps.com", @"wxqcloud"];
+    for (NSString *n in noise)
+        if ([u rangeOfString:n options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return NO;
+    return [u hasPrefix:@"http"];
 }
 
 static void NetLog(NSString *fmt, ...) {
@@ -854,26 +873,61 @@ static void InstallNetworkLogger(void) {
         }));
     }
 
-    // ⑧ -[NSMutableURLRequest setHTTPBody:] —— 请求体（里面可能带着主题 code / 签名）
-    SEL s8 = @selector(setHTTPBody:);
-    Method m8 = class_getInstanceMethod([NSMutableURLRequest class], s8);
-    if (m8) {
-        IMP o8 = method_getImplementation(m8);
-        HookInstance([NSMutableURLRequest class], s8, imp_implementationWithBlock(^void(id me, NSData *bd) {
-            @try {
-                if (bd.length && bd.length < 4000) {
-                    NSString *s = [[NSString alloc] initWithData:bd encoding:NSUTF8StringEncoding];
-                    if (s && ([s containsString:@"code"] || [s containsString:@"theme"]))
-                        NetLog(@"HTTPBODY prep: %@", [s substringToIndex:MIN((NSUInteger)500, s.length)]);
-                }
-            } @catch (NSException *e) { }
-            ((void(*)(id, SEL, id))o8)(me, s8, bd);
-        }));
+    // ⑨ -[NSURLConnection initWithRequest:delegate:] / +connectionWithRequest:delegate:
+    SEL s9 = @selector(initWithRequest:delegate:);
+    Method m9 = class_getInstanceMethod([NSURLConnection class], s9);
+    if (m9) {
+        IMP o9 = method_getImplementation(m9);
+        HookInstance([NSURLConnection class], s9,
+            imp_implementationWithBlock(^id(id me, NSURLRequest *req, id del) {
+                @try { if (IsApiURL(req.URL.absoluteString)) NetLog(@"CONN init → %@", req.URL.absoluteString); }
+                @catch (NSException *e) { }
+                return ((id(*)(id, SEL, id, id))o9)(me, s9, req, del);
+            }));
     }
+    SEL s10 = @selector(connectionWithRequest:delegate:);
+    Method m10 = class_getClassMethod([NSURLConnection class], s10);
+    if (m10) {
+        IMP o10 = method_getImplementation(m10);
+        HookClass([NSURLConnection class], s10,
+            imp_implementationWithBlock(^id(id cls, NSURLRequest *req, id del) {
+                @try { if (IsApiURL(req.URL.absoluteString)) NetLog(@"CONN + → %@", req.URL.absoluteString); }
+                @catch (NSException *e) { }
+                return ((id(*)(id, SEL, id, id))o10)(cls, s10, req, del);
+            }));
+    }
+
+    // ⑩ -[NSURLSession dataTaskWithRequest:]（delegate 模式）
+    SEL s11 = @selector(dataTaskWithRequest:);
+    Method m11 = class_getInstanceMethod([NSURLSession class], s11);
+    if (m11) {
+        IMP o11 = method_getImplementation(m11);
+        HookInstance([NSURLSession class], s11,
+            imp_implementationWithBlock(^id(id me, NSURLRequest *req) {
+                @try { if (IsApiURL(req.URL.absoluteString)) NetLog(@"TASK* → %@ %@", req.HTTPMethod, req.URL.absoluteString); }
+                @catch (NSException *e) { }
+                return ((id(*)(id, SEL, id))o11)(me, s11, req);
+            }));
+    }
+
+    // ⑪ 打印所有已加载镜像 —— 用来找出真正做 HTTP 的那个 framework
+    @try {
+        uint32_t n = _dyld_image_count();
+        LogLine(@"已加载镜像 %u 个：", n);
+        for (uint32_t i = 0; i < n; i++) {
+            const char *p = _dyld_get_image_name(i);
+            if (p && (strstr(p, "/Application/") || strstr(p, "Framework") ||
+                      strstr(p, "WeChat"))) {
+                LogLine(@"   [%u] %s", i, p);
+            }
+        }
+    } @catch (NSException *e) { }
 }
 
 static void InstallAll(int round) {
     @autoreleasepool {
+        LogLine(@"socket 计数: send=%ld sendto=%ld recv=%ld recvfrom=%ld write=%ld read=%ld HTTP=%ld",
+                gNsend, gNsendto, gNrecv, gNrecvfrom, gNwrite, gNread, gNhttp);
         @try { if (round == 1) InstallNetworkLogger(); } @catch (NSException *e) { }
         @try { InstallCryptoHooks(); } @catch (NSException *e) { }
         @try { int n = InstallLoader(); if (n) LogLine(@"第 %d 轮：loader 挂钩 %d 个", round, n); }
