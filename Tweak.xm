@@ -542,10 +542,146 @@ static int InstallBypass(void) {
     return done;
 }
 
+// ============================================================ 路 C：网络监听（找密钥接口）
+// 插件的接口路径是运行时拼装的（二进制里没有明文 /api/），所以直接监听 HTTP：
+// 把主题商城域名下的每个请求 URL / 请求体 / 响应体都记下来 —— 密钥接口自然现形。
+
+static volatile int gNetCount = 0;
+
+static BOOL IsApiURL(NSString *u) {
+    if (!u || u.length == 0) return NO;
+    return [u containsString:@"18179"] || [u containsString:@"api/theme"] ||
+           [u containsString:@"134.122.170.72"] || [u containsString:@"18899/upload"];
+}
+
+static void NetLog(NSString *fmt, ...) {
+    if (gNetCount > 600) return;
+    @try {
+        va_list ap; va_start(ap, fmt);
+        NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        va_end(ap);
+        LogLine(@"[NET] %@", s);
+        gNetCount++;
+    } @catch (NSException *e) { }
+}
+
+static void HookInstance(Class c, SEL sel, IMP repl) {
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) { LogLine(@"  net: 没有 -[%@ %@]", NSStringFromClass(c), NSStringFromSelector(sel)); return; }
+    NSString *idk = [NSString stringWithFormat:@"N:%s|%p", sel_getName(sel), method_getImplementation(m)];
+    if ([gSeen containsObject:idk]) return;
+    [gSeen addObject:idk];
+    method_setImplementation(m, repl);
+    LogLine(@"  net 挂钩 -[%@ %@]", NSStringFromClass(c), NSStringFromSelector(sel));
+}
+
+static void HookClass(Class c, SEL sel, IMP repl) {
+    Method m = class_getClassMethod(c, sel);
+    if (!m) { LogLine(@"  net: 没有 +[%@ %@]", NSStringFromClass(c), NSStringFromSelector(sel)); return; }
+    NSString *idk = [NSString stringWithFormat:@"NC:%s|%p", sel_getName(sel), method_getImplementation(m)];
+    if ([gSeen containsObject:idk]) return;
+    [gSeen addObject:idk];
+    method_setImplementation(m, repl);
+    LogLine(@"  net 挂钩 +[%@ %@]", NSStringFromClass(c), NSStringFromSelector(sel));
+}
+
+static void InstallNetworkLogger(void) {
+    EnsureSeen();
+
+    // ① +[NSURLRequest requestWithURL:]
+    SEL s1 = @selector(requestWithURL:);
+    Method m1 = class_getClassMethod([NSURLRequest class], s1);
+    if (m1) {
+        IMP o1 = method_getImplementation(m1);
+        HookClass([NSURLRequest class], s1, imp_implementationWithBlock(^id(id cls, NSURL *url) {
+            @try { if (IsApiURL(url.absoluteString)) NetLog(@"REQ +NSURLRequest %@", url.absoluteString); }
+            @catch (NSException *e) { }
+            return ((id(*)(id, SEL, id))o1)(cls, s1, url);
+        }));
+    }
+
+    // ② -[NSMutableURLRequest setURL:]
+    SEL s2 = @selector(setURL:);
+    Method m2 = class_getInstanceMethod([NSMutableURLRequest class], s2);
+    if (m2) {
+        IMP o2 = method_getImplementation(m2);
+        HookInstance([NSMutableURLRequest class], s2, imp_implementationWithBlock(^void(id me, NSURL *url) {
+            @try { if (IsApiURL(url.absoluteString)) NetLog(@"REQ setURL %@", url.absoluteString); }
+            @catch (NSException *e) { }
+            ((void(*)(id, SEL, id))o2)(me, s2, url);
+        }));
+    }
+
+    // ③ -[NSURLSession dataTaskWithRequest:completionHandler:]  ← 主战场
+    SEL s3 = @selector(dataTaskWithRequest:completionHandler:);
+    Method m3 = class_getInstanceMethod([NSURLSession class], s3);
+    if (m3) {
+        IMP o3 = method_getImplementation(m3);
+        HookInstance([NSURLSession class], s3,
+            imp_implementationWithBlock(^id(id me, NSURLRequest *req, id handler) {
+                NSString *u = req.URL.absoluteString;
+                if (!IsApiURL(u))
+                    return ((id(*)(id, SEL, id, id))o3)(me, s3, req, handler);
+                @try {
+                    NetLog(@"HTTP → %@ %@", req.HTTPMethod, u);
+                    if (req.HTTPBody.length) {
+                        NSString *b = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
+                        NetLog(@"      req-body: %@", b ? [b substringToIndex:MIN((NSUInteger)600, b.length)]
+                                                       : [NSString stringWithFormat:@"<bin %lu>", (unsigned long)req.HTTPBody.length]);
+                    }
+                } @catch (NSException *e) { }
+                if (!handler)
+                    return ((id(*)(id, SEL, id, id))o3)(me, s3, req, handler);
+                id wrapped = [^(NSData *d, NSURLResponse *resp, NSError *err) {
+                    @try {
+                        NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
+                        NetLog(@"HTTP ← %ld  %luB  %@", (long)code, (unsigned long)d.length, u);
+                        if (d.length) {
+                            NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                            if (s) NetLog(@"      resp: %@", [s substringToIndex:MIN((NSUInteger)1500, s.length)]);
+                            else {
+                                // 二进制响应：前 64 字节 hex —— 密钥包会是 224/240 字节
+                                const uint8_t *p = d.bytes;
+                                NSMutableString *hx = [NSMutableString string];
+                                for (NSUInteger i = 0; i < MIN((NSUInteger)64, d.length); i++)
+                                    [hx appendFormat:@"%02x", p[i]];
+                                NetLog(@"      resp-bin(%lu): %@", (unsigned long)d.length, hx);
+                            }
+                        }
+                    } @catch (NSException *e) { }
+                    if (handler) ((void(^)(NSData *, NSURLResponse *, NSError *))handler)(d, resp, err);
+                } copy];
+                return ((id(*)(id, SEL, id, id))o3)(me, s3, req, wrapped);
+            }));
+    }
+
+    // ④ +[NSURLConnection sendSynchronousRequest:returningResponse:error:]
+    SEL s4 = @selector(sendSynchronousRequest:returningResponse:error:);
+    Method m4 = class_getClassMethod([NSURLConnection class], s4);
+    if (m4) {
+        IMP o4 = method_getImplementation(m4);
+        HookClass([NSURLConnection class], s4,
+            imp_implementationWithBlock(^NSData *(id cls, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
+                @try { if (IsApiURL(req.URL.absoluteString)) NetLog(@"SYNC → %@", req.URL.absoluteString); }
+                @catch (NSException *e) { }
+                NSData *d = ((NSData *(*)(id, SEL, id, void *, void *))o4)(cls, s4, req, resp, err);
+                @try {
+                    if (IsApiURL(req.URL.absoluteString)) {
+                        NetLog(@"SYNC ← %luB %@", (unsigned long)d.length, req.URL.absoluteString);
+                        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                        if (s) NetLog(@"      resp: %@", [s substringToIndex:MIN((NSUInteger)1500, s.length)]);
+                    }
+                } @catch (NSException *e) { }
+                return d;
+            }));
+    }
+}
+
 // ============================================================ 装载
 
 static void InstallAll(int round) {
     @autoreleasepool {
+        @try { if (round == 1) InstallNetworkLogger(); } @catch (NSException *e) { }
         @try { InstallCryptoHooks(); } @catch (NSException *e) { }
         @try { int n = InstallLoader(); if (n) LogLine(@"第 %d 轮：loader 挂钩 %d 个", round, n); }
         @catch (NSException *e) { }
