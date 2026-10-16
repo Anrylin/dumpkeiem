@@ -675,9 +675,81 @@ static void InstallNetworkLogger(void) {
                 return d;
             }));
     }
-}
+    // ⑤ +[NSURL URLWithString:] —— 最全面的入口：任何 URL 构造都会经过这里
+    SEL s5 = @selector(URLWithString:);
+    Method m5 = class_getClassMethod([NSURL class], s5);
+    if (m5) {
+        IMP o5 = method_getImplementation(m5);
+        HookClass([NSURL class], s5, imp_implementationWithBlock(^id(id cls, NSString *str) {
+            @try { if (IsApiURL(str)) NetLog(@"NSURL URLWithString: %@", str); }
+            @catch (NSException *e) { }
+            return ((id(*)(id, SEL, id))o5)(cls, s5, str);
+        }));
+    }
 
-// ============================================================ 装载
+    // ⑥ -[NSURLSession dataTaskWithURL:completionHandler:]
+    SEL s6 = @selector(dataTaskWithURL:completionHandler:);
+    Method m6 = class_getInstanceMethod([NSURLSession class], s6);
+    if (m6) {
+        IMP o6 = method_getImplementation(m6);
+        HookInstance([NSURLSession class], s6,
+            imp_implementationWithBlock(^id(id me, NSURL *url, id handler) {
+                if (!IsApiURL(url.absoluteString))
+                    return ((id(*)(id, SEL, id, id))o6)(me, s6, url, handler);
+                NetLog(@"HTTP(url) → %@", url.absoluteString);
+                if (!handler) return ((id(*)(id, SEL, id, id))o6)(me, s6, url, handler);
+                id wrapped = [^(NSData *d, NSURLResponse *resp, NSError *err) {
+                    @try {
+                        NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
+                        NetLog(@"HTTP(url) ← %ld  %luB  %@", (long)code, (unsigned long)d.length,
+                               url.absoluteString);
+                        NetLog(@"      resp-bin(%lu): %@", (unsigned long)d.length,
+                               HexStr((const uint8_t *)d.bytes, MIN((NSUInteger)64, d.length), 64));
+                    } @catch (NSException *e) { }
+                    if (handler) ((void(^)(NSData *, NSURLResponse *, NSError *))handler)(d, resp, err);
+                } copy];
+                return ((id(*)(id, SEL, id, id))o6)(me, s6, url, wrapped);
+            }));
+    }
+
+    // ⑦ 所有「不带 completionHandler」的任务（delegate 模式）：在 resume 时记录 URL
+    SEL s7 = @selector(resume);
+    Method m7 = class_getInstanceMethod([NSURLSessionTask class], s7);
+    if (m7) {
+        IMP o7 = method_getImplementation(m7);
+        HookInstance([NSURLSessionTask class], s7, imp_implementationWithBlock(^void(id me) {
+            @try {
+                NSURLRequest *rq = [me valueForKey:@"originalRequest"];
+                if (rq && IsApiURL(rq.URL.absoluteString)) {
+                    NetLog(@"TASK → %@ %@", rq.HTTPMethod, rq.URL.absoluteString);
+                    if (rq.HTTPBody.length) {
+                        NSString *b = [[NSString alloc] initWithData:rq.HTTPBody encoding:NSUTF8StringEncoding];
+                        NetLog(@"      req-body: %@", b ? [b substringToIndex:MIN((NSUInteger)800, b.length)]
+                                                       : [NSString stringWithFormat:@"<bin %lu>", (unsigned long)rq.HTTPBody.length]);
+                    }
+                }
+            } @catch (NSException *e) { }
+            ((void(*)(id, SEL))o7)(me, s7);
+        }));
+    }
+
+    // ⑧ -[NSMutableURLRequest setHTTPBody:] —— 请求体（里面可能带着主题 code / 签名）
+    SEL s8 = @selector(setHTTPBody:);
+    Method m8 = class_getInstanceMethod([NSMutableURLRequest class], s8);
+    if (m8) {
+        IMP o8 = method_getImplementation(m8);
+        HookInstance([NSMutableURLRequest class], s8, imp_implementationWithBlock(^void(id me, NSData *bd) {
+            @try {
+                if (bd.length && bd.length < 4000) {
+                    NSString *s = [[NSString alloc] initWithData:bd encoding:NSUTF8StringEncoding];
+                    if (s && ([s containsString:@"code"] || [s containsString:@"theme"]))
+                        NetLog(@"HTTPBODY prep: %@", [s substringToIndex:MIN((NSUInteger)500, s.length)]);
+                }
+            } @catch (NSException *e) { }
+            ((void(*)(id, SEL, id))o8)(me, s8, bd);
+        }));
+    }
+}
 
 static void InstallAll(int round) {
     @autoreleasepool {
