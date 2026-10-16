@@ -1,0 +1,9 @@
+Package: com.yg.dumpkeiem
+Name: DumpKeiem
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 把 ThemeBox/KeiEm 主题解密后的原版素材与密钥导出到 /var/mobile/Media/keiem_dump，方便离线批量处理
+Maintainer: YG
+Author: YG
+Section: Tweaks
+Depends: mobilesubstrate
