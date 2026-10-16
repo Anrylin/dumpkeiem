@@ -322,7 +322,7 @@ static void DumpIvars(id obj, const char *why) {
             NSUInteger len = 0;
             if ([v respondsToSelector:@selector(length)]) len = [v length];
             else if ([v respondsToSelector:@selector(count)]) len = [v count];
-            [head appendFormat:@"%s=%@(%lu) ", n, NSStringFromClass([v class]), (unsigned long)len];
+            [head appendFormat:@"%s:%s=%@(%lu) ", n, t ? t : "?", NSStringFromClass([v class]), (unsigned long)len];
 
             if ([v isKindOfClass:[NSData class]] && [v length] > 80000) {
                 NSString *p = [Dir() stringByAppendingPathComponent:
@@ -442,6 +442,9 @@ static int InstallAES(void) {
     }
     return done;
 }
+
+// 前置声明：HookViaSlots 的定义在本文件靠后的「装载」段
+static int HookViaSlots(const char *sym, void *repl, void **orig);
 
 /// 只做「按值扫槽」这件事。可以在解密之后反复调用：那时懒绑定槽已被 dyld 填上真地址。
 static int HookSlotsNow(void) {
