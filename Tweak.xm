@@ -17,29 +17,50 @@
 #import <stdlib.h>
 #import <string.h>
 
-#define kDir @"/var/mobile/Media/keiem_dump"
-#define kLog @"/var/mobile/Media/keiem_dump/log.txt"
+#define kDirMedia @"/var/mobile/Media/keiem_dump"
 
 // ---------------- 工具 ----------------
 
-static NSString *gWhy = nil;
+static NSString *gDir = nil;    // 实际可写的输出目录
+static NSString *gLog = nil;    // log.txt 路径
 
-static void EnsureDir(void) {
-    [[NSFileManager defaultManager] createDirectoryAtPath:kDir
-                              withIntermediateDirectories:YES
-                                               attributes:nil error:nil];
+/// 优先写沙盒外的 Media（Filza 好找）；写不进去（被沙盒拦）就回退到 app 自己的 Documents
+static NSString *Dir(void) {
+    if (gDir) return gDir;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *e = nil;
+    if ([fm createDirectoryAtPath:kDirMedia withIntermediateDirectories:YES attributes:nil error:&e]) {
+        NSString *t = [kDirMedia stringByAppendingPathComponent:@".wtest"];
+        if ([@"x" writeToFile:t atomically:YES encoding:NSUTF8StringEncoding error:&e]) {
+            [fm removeItemAtPath:t error:nil];
+            gDir = kDirMedia;
+        }
+    }
+    if (!gDir) {
+        NSString *d = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/keiem_dump"];
+        [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+        gDir = d;
+    }
+    return gDir;
 }
+
+static NSString *LogPath(void) {
+    if (!gLog) gLog = [Dir() stringByAppendingPathComponent:@"log.txt"];
+    return gLog;
+}
+
+static void EnsureDir(void) { (void)Dir(); }
 
 static void LogLine(NSString *fmt, ...) {
     @try {
         va_list ap; va_start(ap, fmt);
         NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
         va_end(ap);
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                          [NSDate date], s];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLog];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], s];
+        NSString *p = LogPath();
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
         if (!fh) {
-            [line writeToFile:kLog atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
         } else {
             [fh seekToEndOfFile];
             [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
@@ -111,17 +132,17 @@ static void DumpThing(NSString *where, NSArray *args) {
 
         // 解密后的容器（大块 NSData）单独落盘 —— 这是离线处理的关键
         if (payload) {
-            NSString *p = [kDir stringByAppendingPathComponent:
+            NSString *p = [Dir() stringByAppendingPathComponent:
                            [NSString stringWithFormat:@"payload_%@_%lu.bin", Stamp(), (unsigned long)payload.length]];
             [payload writeToFile:p atomically:YES];
             [sum appendFormat:@"  >> 数据落盘: %@ (%lu B)\n", p, (unsigned long)payload.length];
         }
 
-        // 追加到 log（同时保留最后一次到 key.txt，方便直接拿）
-        NSString *cur = [NSString stringWithContentsOfFile:kLog encoding:NSUTF8StringEncoding error:nil] ?: @"";
-        [[cur stringByAppendingString:sum] writeToFile:kLog atomically:YES
+        // 追加到 log（同时保留最后一次到 last.txt，方便直接拿）
+        NSString *cur = [NSString stringWithContentsOfFile:LogPath() encoding:NSUTF8StringEncoding error:nil] ?: @"";
+        [[cur stringByAppendingString:sum] writeToFile:LogPath() atomically:YES
                                               encoding:NSUTF8StringEncoding error:nil];
-        [sum writeToFile:[kDir stringByAppendingPathComponent:@"last.txt"] atomically:YES
+        [sum writeToFile:[Dir() stringByAppendingPathComponent:@"last.txt"] atomically:YES
                 encoding:NSUTF8StringEncoding error:nil];
         NSLog(@"[DumpKeiem] %@", sum);
     } @catch (NSException *e) { }
@@ -360,14 +381,14 @@ static void InstallHooks(void) {
         }
     }
     free(list);
-    LogLine(@"扫描 %d 个类，挂钩 %d 个方法，镜像=%@", clsCount, hooked, gWhy ?: @"NewMessageRingUtil");
+    LogLine(@"扫描 %d 个类，挂钩 %d 个方法（镜像 NewMessageRingUtil）", clsCount, hooked);
 }
 
 __attribute__((constructor))
 static void InitDump(void) {
     @autoreleasepool {
         EnsureDir();
-        LogLine(@"DumpKeiem 启动，输出目录 %@", kDir);
+        LogLine(@"DumpKeiem 启动，输出目录 %@", Dir());
         // 插件可能还没加载，稍后再扫
         for (NSNumber *delay in @[@0, @3, @8, @20, @40]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
