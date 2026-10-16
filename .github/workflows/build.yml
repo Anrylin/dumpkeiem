@@ -1,0 +1,52 @@
+name: build-deb
+
+# 云端编译 DumpKeiem 插件。
+# 触发方式：push 代码，或到 Actions 页面点 "Run workflow"。
+# 产物：debs（Artifacts 里下载），三种 scheme 都编一遍，哪个能装用哪个。
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Theos
+        uses: Randomblock1/theos-action@main
+
+      - name: Show environment
+        run: |
+          echo "THEOS=$THEOS"
+          ls "$THEOS" || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+
+      - name: Build (roothide / rootless / rootful)
+        run: |
+          set -x
+          mkdir -p out
+          for scheme in roothide rootless rootful; do
+            make clean >/dev/null 2>&1 || true
+            if [ "$scheme" = "rootful" ]; then
+              make package FINALPACKAGE=1 || true
+            else
+              make package THEOS_PACKAGE_SCHEME="$scheme" FINALPACKAGE=1 || true
+            fi
+            for f in packages/*.deb; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f" .deb)
+              cp "$f" "out/${base}__${scheme}.deb"
+            done
+          done
+          echo "=== built ==="
+          ls -la out || true
+
+      - name: Upload debs
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: out/*.deb
+          if-no-files-found: warn
+          retention-days: 30
