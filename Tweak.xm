@@ -150,7 +150,6 @@ static int Rebind(const struct mach_header_64 *mh, intptr_t slide, RebindItem *i
                 case BIND_OPCODE_SET_ADDEND_SLEB: rd_sleb(&d); break;
                 case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: seg = imm; seg_off = rd_uleb(&d); break;
                 case BIND_OPCODE_ADD_ADDR_ULEB: seg_off += rd_uleb(&d); break;
-                case BIND_OPCODE_ADD_ADDR_IMM_SCALED: seg_off += (uint64_t)imm * 8; break;
 
                 case BIND_OPCODE_DO_BIND:
                 case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
