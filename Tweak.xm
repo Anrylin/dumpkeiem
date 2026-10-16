@@ -37,6 +37,8 @@
 #define OFF_CCCrypt        0x50a4038UL
 #define OFF_CCHmac         0x50a4040UL
 #define OFF_PBKDF2         0x50a4048UL
+#define OFF_CFReadStream   0x50a40e8UL   // _CFReadStreamRead
+#define OFF_CFWriteStream  0x50a4178UL   // _CFWriteStreamWrite
 
 // ============================================================ 目录与日志
 
@@ -129,6 +131,49 @@ static CCHmac_t  gCCHmac  = NULL;
 static PBKDF2_t  gPBKDF2  = NULL;
 static volatile int gBigCipher = 0, gBigPlain = 0;
 
+// ---- 原始 HTTP 抓取（插件用手搓 CFRead/WriteStream 走网络，绕过 NSURLSession）----
+typedef long (*CFWrite_t)(void *stream, const uint8_t *buf, long len);
+typedef long (*CFRead_t)(void *stream, uint8_t *buf, long len);
+static CFWrite_t gCFWrite = NULL;
+static CFRead_t  gCFRead  = NULL;
+static volatile int gRawCount = 0;
+
+static BOOL LooksHTTP(const uint8_t *b, long n) {
+    if (!b || n < 8) return NO;
+    char tmp[600];
+    long m = n < 560 ? n : 560;
+    memcpy(tmp, b, m);
+    tmp[m] = 0;
+    return (strstr(tmp, "HTTP/1.") || strstr(tmp, "Host:") || strstr(tmp, "POST ") ||
+            strstr(tmp, "GET ") || strstr(tmp, "Content-Length") || strstr(tmp, "User-Agent"));
+}
+
+static long my_CFWrite(void *s, const uint8_t *buf, long len) {
+    @try {
+        if (gRawCount < 300 && buf && len > 0 && LooksHTTP(buf, len)) {
+            gRawCount++;
+            NSString *txt = [[NSString alloc] initWithBytes:buf length:MIN((long)500, len)
+                                                   encoding:NSUTF8StringEncoding];
+            LogLine(@"[RAW-OUT %ldB] %@", len, txt ? txt : HexStr(buf, len, 240));
+        }
+    } @catch (NSException *e) { }
+    return gCFWrite ? gCFWrite(s, buf, len) : -1;
+}
+
+static long my_CFRead(void *s, uint8_t *buf, long len) {
+    long r = gCFRead ? gCFRead(s, buf, len) : -1;
+    @try {
+        if (gRawCount < 300 && r > 0 && LooksHTTP(buf, r)) {
+            gRawCount++;
+            NSString *txt = [[NSString alloc] initWithBytes:buf length:MIN((long)600, r)
+                                                   encoding:NSUTF8StringEncoding];
+            LogLine(@"[RAW-IN  %ldB] %@", r, txt ? txt : HexStr(buf, r, 240));
+        }
+    } @catch (NSException *e) { }
+    return r;
+}
+
+
 static void SaveKeyJSON(NSString *via, NSString *keyHex, NSString *ivHex,
                         size_t keyLen, size_t cipherLen, NSString *cipherHead) {
     NSString *j = [NSString stringWithFormat:
@@ -156,6 +201,10 @@ static int my_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
         LogLine(@"   KEY = %@", kh);
         LogLine(@"   IV  = %@", ih);
         LogLine(@"   密文头 = %@", HexStr(in, 32, 32));
+        if (inLen <= 512 && in) {
+            NSString *t = [[NSString alloc] initWithBytes:in length:inLen encoding:NSUTF8StringEncoding];
+            LogLine(@"   [输入全文 %zuB] %@", inLen, t ? t : HexStr(in, inLen, 512));
+        }
         if (kh.length) SaveKeyJSON(@"CCCrypt", kh, ih, keyLen, inLen, HexStr(in, 32, 32));
         if (in && inLen > 4096 && !gBigCipher) {
             gBigCipher = 1;
@@ -168,6 +217,10 @@ static int my_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
     @autoreleasepool {
         size_t mv = moved ? *moved : 0;
         LogLine(@"   返回 %d 明文长度 %zu 明文头 %@", r, mv, HexStr(out, mv ? mv : 32, 48));
+        if (mv && mv <= 512 && out) {
+            NSString *t = [[NSString alloc] initWithBytes:out length:mv encoding:NSUTF8StringEncoding];
+            LogLine(@"   [输出全文 %zuB] %@", mv, t ? t : HexStr(out, mv, 512));
+        }
         if (out && mv > 4096 && !gBigPlain) {
             gBigPlain = 1;
             [[NSData dataWithBytes:out length:mv]
@@ -224,8 +277,10 @@ static void InstallCryptoHooks(void) {
         { OFF_CCCrypt, (void *)my_CCCrypt, NULL, "CCCrypt" },
         { OFF_CCHmac,  (void *)my_CCHmac,  NULL, "CCHmac" },
         { OFF_PBKDF2,  (void *)my_PBKDF2,  NULL, "CCKeyDerivationPBKDF" },
+        { OFF_CFWriteStream, (void *)my_CFWrite, (void **)&gCFWrite, "CFWriteStreamWrite" },
+        { OFF_CFReadStream,  (void *)my_CFRead,  (void **)&gCFRead,  "CFReadStreamRead" },
     };
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         void **slot = (void **)((uintptr_t)base + T[i].off);
         void *cur = *slot;
         LogLine(@"   %s 槽 %p 当前值 %p", T[i].name, (void *)slot, cur);
@@ -234,7 +289,14 @@ static void InstallCryptoHooks(void) {
         void *real = NULL;
         if (i == 0) real = (void *)gCCCrypt;
         else if (i == 1) real = (void *)gCCHmac;
-        else real = (void *)gPBKDF2;
+        else if (i == 2) real = (void *)gPBKDF2;
+        else if (i == 3) {
+            if (!gCFWrite) gCFWrite = (CFWrite_t)dlsym(RTLD_DEFAULT, "CFWriteStreamWrite");
+            real = (void *)gCFWrite;
+        } else {
+            if (!gCFRead) gCFRead = (CFRead_t)dlsym(RTLD_DEFAULT, "CFReadStreamRead");
+            real = (void *)gCFRead;
+        }
         if (!real) { LogLine(@"   !! dlsym %s 失败，跳过", T[i].name); continue; }
         // ★ 自校验：槽里的值必须「像未解析的 stub-helper（落在插件镜像内）」
         //   或「等于 dlsym 拿到的真函数」。两者都不是 → 偏移不对，绝不写，防止挂错函数导致崩溃。
