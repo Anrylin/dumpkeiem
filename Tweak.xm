@@ -211,7 +211,7 @@ static BOOL InterestingSize(NSUInteger n) {
 // ---- 追踪「读文件」：密钥包从哪个文件来的 ----
 typedef id (*DataFile_t)(id, SEL, id);
 
-static void InstallFileHooks(void) {
+__attribute__((unused)) static void InstallFileHooks(void) {
     EnsureSeen();
     Class NSD = [NSData class];
 
@@ -319,7 +319,7 @@ static const char *FdDest(int fd) {
     return "?";
 }
 
-static int my_socket(int dom, int type, int proto) {
+__attribute__((unused)) static int my_socket(int dom, int type, int proto) {
     int fd = gSocket ? gSocket(dom, type, proto) : -1;
     if (fd >= 0 && gNconn < 200) {
         gNconn++;
@@ -328,7 +328,7 @@ static int my_socket(int dom, int type, int proto) {
     return fd;
 }
 
-static int my_connect(int fd, const void *addr, unsigned int alen) {
+__attribute__((unused)) static int my_connect(int fd, const void *addr, unsigned int alen) {
     @try {
         const uint8_t *a = (const uint8_t *)addr;
         char buf[72] = "";
@@ -349,7 +349,7 @@ static int my_connect(int fd, const void *addr, unsigned int alen) {
     return gConnect ? gConnect(fd, addr, alen) : -1;
 }
 
-static int my_close(int fd) {
+__attribute__((unused)) static int my_close(int fd) {
     if (fd >= 0 && fd < FDMAP_N) gFdDest[fd][0] = 0;
     return gClose ? gClose(fd) : -1;
 }
@@ -1055,7 +1055,7 @@ static BOOL SeenOnce(NSString *key) {
     return YES;
 }
 
-static void InstallEnvelopeHooks(void) {
+__attribute__((unused)) static void InstallEnvelopeHooks(void) {
     SEL s1 = NSSelectorFromString(@"encryptedEnvelopeWithBusinessParams:context:error:");
     SEL s2 = NSSelectorFromString(@"decryptResponseEnvelope:context:error:");
     SEL s3 = NSSelectorFromString(@"signCanonicalString:derivedKey:");
