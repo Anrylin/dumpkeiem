@@ -144,6 +144,10 @@ typedef void (*IMPV1)(id, SEL, id);
 // 已经钩过的实现，避免重复挂钩
 static NSMutableSet *gHooked = nil;
 
+static void EnsureHooked(void) {
+    if (!gHooked) gHooked = [NSMutableSet set];
+}
+
 // 返回 void 的方法（loader 是 void，getter 是 id）—— 必须分开，否则 ARC 会误解返回值
 static BOOL ReturnsVoid(SEL sel) {
     const char *n = sel_getName(sel);
@@ -229,8 +233,115 @@ static NSDictionary<NSString *, NSNumber *> *Targets(void) {
     };
 }
 
+// ==================== 授权绕过 ====================
+// 这些是"检查/校验"类方法：强制返回成功，并记录调用（方便回头确认哪个才是真正的门）
+// 0 = 参数个数未知，按探测到的类型走
+static NSDictionary<NSString *, NSNumber *> *BypassReturns(void) {
+    //  key: 选择器   value: 强制返回的值（对象，通常是 @YES / @1）
+    return @{
+        @"checkAuthabc":                          @YES,
+        @"verifySign:canonical:derivedKey:":      @YES,
+        @"verifyResponseSign:data:nonce:ts:sessionKey:": @YES,
+        @"isExpired":                             @NO,
+        @"validateFavoriteImageMessage:reason:":  @YES,
+    };
+}
+
+// 只记录、不改返回值（用来"看"授权链路到底调了哪些东西）
+static NSArray<NSString *> *WatchOnly(void) {
+    return @[
+        @"fetchAndSaveReceiptForTheme:",
+        @"setPendingReceiptThemeID:",
+        @"pendingReceiptThemeID",
+        @"receiptSocket",
+        @"setReceiptSocket:",
+        @"importConfigFromDictionary:",
+        @"keiEmImportBackupZip",
+        @"java_setDisplayName:",
+    ];
+}
+
+// ---------------- 强制返回 ----------------
+
+typedef BOOL (*IMP_BOOL)(id, SEL, ...);
+
+static void InstallBypass(void) {
+    NSDictionary *bp = BypassReturns();
+    int done = 0;
+    int clsCount = objc_getClassList(NULL, 0);
+    if (clsCount <= 0) return;
+    Class *list = (Class *)malloc(sizeof(Class) * clsCount);
+    objc_getClassList(list, clsCount);
+    for (int i = 0; i < clsCount; i++) {
+        Class c = list[i];
+        if (!IsPluginClass(c)) continue;
+        for (NSString *s in bp) {
+            SEL sel = NSSelectorFromString(s);
+            Method m = class_getInstanceMethod(c, sel);
+            if (!m) continue;
+            IMP orig = method_getImplementation(m);
+            NSString *key = [NSString stringWithFormat:@"BP:%s|%p", sel_getName(sel), orig];
+            if ([gHooked containsObject:key]) continue;
+            [gHooked addObject:key];
+
+            id forced = bp[s];
+            SEL cs = sel;
+            // 固定 4 参数签名：多余的参数被忽略，少参数时也多读无害（不取用）
+            IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3, id a4) {
+                (void)a2; (void)a3; (void)a4;
+                BOOL val = [forced boolValue];
+                LogLine(@"★ 授权绕过命中: -[%@ %@] 强制返回 %@",
+                        NSStringFromClass([self class]), NSStringFromSelector(cs),
+                        val ? @"YES" : @"NO");
+                return forced;
+            });
+            method_setImplementation(m, r);
+            done++;
+            LogLine(@"bypass 挂钩 -[%@ %@]", NSStringFromClass(c), s);
+        }
+    }
+    free(list);
+    LogLine(@"授权绕过：挂了 %d 个方法", done);
+}
+
+// ---------------- 只记录 ----------------
+
+static void InstallWatch(void) {
+    NSArray *wl = WatchOnly();
+    int done = 0;
+    int clsCount = objc_getClassList(NULL, 0);
+    if (clsCount <= 0) return;
+    Class *list = (Class *)malloc(sizeof(Class) * clsCount);
+    objc_getClassList(list, clsCount);
+    for (int i = 0; i < clsCount; i++) {
+        Class c = list[i];
+        if (!IsPluginClass(c)) continue;
+        for (NSString *s in wl) {
+            SEL sel = NSSelectorFromString(s);
+            Method m = class_getInstanceMethod(c, sel);
+            if (!m) continue;
+            IMP orig = method_getImplementation(m);
+            NSString *key = [NSString stringWithFormat:@"WO:%s|%p", sel_getName(sel), orig];
+            if ([gHooked containsObject:key]) continue;
+            [gHooked addObject:key];
+            SEL cs = sel;
+            // 统一按「最多 3 个参数」包装：多余的寄存器参数不影响
+            IMP r = imp_implementationWithBlock(^id(id self, id a2, id a3, id a4) {
+                DumpThing([NSString stringWithFormat:@"WATCH -[%@ %@]",
+                           NSStringFromClass([self class]), NSStringFromSelector(cs)],
+                          @[a2 ?: [NSNull null], a3 ?: [NSNull null], a4 ?: [NSNull null]]);
+                return ((IMP3)orig)(self, cs, a2, a3, a4);
+            });
+            method_setImplementation(m, r);
+            done++;
+        }
+    }
+    free(list);
+    LogLine(@"观察点：挂了 %d 个方法", done);
+}
+
 static void InstallHooks(void) {
-    gHooked = [NSMutableSet set];
+    EnsureHooked();
     NSDictionary *tg = Targets();
     int clsCount = objc_getClassList(NULL, 0);
     if (clsCount <= 0) return;
@@ -257,11 +368,17 @@ static void InitDump(void) {
     @autoreleasepool {
         EnsureDir();
         LogLine(@"DumpKeiem 启动，输出目录 %@", kDir);
-        // 插件可能还没加载，稍后再扫一次
-        InstallHooks();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8ull * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ InstallHooks(); });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20ull * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ InstallHooks(); });
+        // 插件可能还没加载，稍后再扫
+        for (NSNumber *delay in @[@0, @3, @8, @20, @40]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    InstallHooks();     // 抓取点
+                    InstallBypass();    // 授权绕过
+                    InstallWatch();     // 观察点
+                } @catch (NSException *e) { LogLine(@"扫描异常: %@", e); }
+            });
+        }
     }
 }
