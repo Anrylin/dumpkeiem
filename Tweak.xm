@@ -171,7 +171,7 @@ static void SaveOneFile(NSString *theme, NSString *name, NSData *d) {
     @try {
         NSString *safe = [theme stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
         NSString *base = [[Dir() stringByAppendingPathComponent:@"KM"] stringByAppendingPathComponent:safe];
-        NSString *rel = [name stringByReplacingOccurrencesOfString:@".." withString:"_"];
+        NSString *rel = [name stringByReplacingOccurrencesOfString:@".." withString:@"_"];
         NSString *p = [base stringByAppendingPathComponent:rel];
         [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
                                   withIntermediateDirectories:YES attributes:nil error:nil];
