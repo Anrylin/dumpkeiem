@@ -1,12 +1,14 @@
 name: build-deb
 
 # 云端编译 DumpKeiem 插件。
-# 触发方式：push 代码，或到 Actions 页面点 "Run workflow"。
-# 产物：debs（Artifacts 里下载），三种 scheme 都编一遍，哪个能装用哪个。
+# 产物走两条通道：Actions Artifacts（主）+ GitHub Release（备用，更可靠）。
 
 on:
   push:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,12 +18,6 @@ jobs:
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@main
-
-      - name: Show environment
-        run: |
-          echo "THEOS=$THEOS"
-          ls "$THEOS" || true
-          xcrun --sdk iphoneos --show-sdk-version || true
 
       - name: Build (rootless + rootful)
         run: |
@@ -42,11 +38,39 @@ jobs:
           done
           echo "=== built ==="
           ls -la out || true
+          echo "=== sha256 ==="
+          shasum -a 256 out/*.deb || true
+          echo "=== dylib inside ==="
+          for f in out/*rootless*.deb; do
+            [ -e "$f" ] || continue
+            mkdir -p /tmp/x && cd /tmp/x && rm -rf * 
+            ar x "/Users/runner/work/dumpkeiem/dumpkeiem/$f" 2>/dev/null || ar x "$f" || true
+            ls
+          done
+          true
 
-      - name: Upload debs
+      - name: Upload debs (artifact)
+        if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: debs
           path: out/*.deb
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Publish release (fallback channel)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la out || true
+          if ls out/*.deb >/dev/null 2>&1; then
+            gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+            gh release create latest $(ls out/*.deb) \
+              --title "latest build" \
+              --notes "auto build $(date -u +%FT%TZ)" || true
+            echo "release published"
+          else
+            echo "no deb to publish"
+          fi
