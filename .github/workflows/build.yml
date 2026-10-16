@@ -23,11 +23,11 @@ jobs:
           ls "$THEOS" || true
           xcrun --sdk iphoneos --show-sdk-version || true
 
-      - name: Build (roothide / rootless / rootful)
+      - name: Build (rootless + rootful)
         run: |
           set -x
           mkdir -p out
-          for scheme in roothide rootless rootful; do
+          for scheme in rootless rootful; do
             make clean >/dev/null 2>&1 || true
             if [ "$scheme" = "rootful" ]; then
               make package FINALPACKAGE=1 || true
