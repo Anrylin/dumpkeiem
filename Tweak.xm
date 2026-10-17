@@ -861,8 +861,18 @@ static void RunReceipts(void) {
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:dp];
                 if (!fh) [d writeToFile:dp atomically:YES];
                 else { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
-                if (n % 5 == 0)
+                if (n % 5 == 0) {
                     LogLine(@"收据进度 %d  当前 %@  累计密钥 %d", n, code, gKeysFound);
+                    // ★ 写一个 progress.txt 到 Documents，Filza 点开就能看进度
+                    @try {
+                        NSString *pp = [[Dir() stringByDeletingLastPathComponent]
+                                        stringByAppendingPathComponent:@"progress.txt"];
+                        NSString *ps = [NSString stringWithFormat:
+                            @"累计密钥 %d\n进度 %d / 5579\n最后处理 %@\n时间 %@",
+                            gKeysFound, n, code, [NSDate date]];
+                        [ps writeToFile:pp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                    } @catch (NSException *e) { }
+                }
                 // ★ 降速：每个请求后等 0.5 秒（每秒 2 个），避免冲崩插件 socket
                 [NSThread sleepForTimeInterval:0.5];
             } @catch (NSException *e) { LogLine(@"收据异常 %@ : %@", code, e); }
@@ -1550,13 +1560,13 @@ static void InitDump(void) {
         (void)Dir();
         // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
         LogLine(@"############################################################");
-        LogLine(@"##########  DumpKeiem v28  BUILD-C7  2026-10-16  ###########");
+        LogLine(@"##########  DumpKeiem v29  BUILD-C8  2026-10-16  ###########");
         LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
         LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
         // 额外写一份版本标记到稳定位置，方便确认
         @try {
-            NSString *tag = @"DumpKeiem v28 BUILD-C7\n";
+            NSString *tag = @"DumpKeiem v29 BUILD-C8\n";
             for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
                                   [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
                 [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
