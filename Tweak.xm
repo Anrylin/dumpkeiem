@@ -784,6 +784,7 @@ static id FindReceiptTarget(void) {
 
 static void RunReceipts(void) {
     @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
         // 依次尝试多个位置（roothide 下 /var/mobile/Media 可能读不到，沙盒最可靠）
         NSArray *paths = @[
             @"/var/mobile/Media/km_codes.txt",
@@ -791,13 +792,44 @@ static void RunReceipts(void) {
             [[Dir() stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"km_codes.txt"],
         ];
         NSString *lp = nil;
-        NSFileManager *fm = [NSFileManager defaultManager];
         for (NSString *p in paths)
             if ([fm fileExistsAtPath:p]) { lp = p; break; }
+
+        // 兜底：不区分大小写 + 前缀模糊匹配（防文件名差一两个字符）
+        if (!lp) {
+            NSArray *dirs = @[@"/var/mobile/Media",
+                              [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"],
+                              [Dir() stringByDeletingLastPathComponent]];
+            for (NSString *d in dirs) {
+                for (NSString *f in [fm contentsOfDirectoryAtPath:d error:nil]) {
+                    if ([f.lowercaseString hasPrefix:@"km_codes"] ||
+                        [f.lowercaseString containsString:@"km_codes"] ||
+                        [f.lowercaseString hasPrefix:@"km-codes"]) {
+                        lp = [d stringByAppendingPathComponent:f];
+                        LogLine(@"收据批量：模糊匹配到清单 %@", lp);
+                        break;
+                    }
+                }
+                if (lp) break;
+            }
+        }
+
         NSString *txt = lp ? [NSString stringWithContentsOfFile:lp encoding:NSUTF8StringEncoding error:nil] : nil;
         if (!txt) {
             LogLine(@"收据批量：找不到 km_codes.txt（随便放一个位置都行）：");
             for (NSString *p in paths) LogLine(@"    候选：%@", p);
+            // ★ 把这两个目录里实际有哪些文件全列出来，好定位你放成了什么名
+            for (NSString *d in @[@"/var/mobile/Media",
+                                  [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]]) {
+                NSArray *fs = [fm contentsOfDirectoryAtPath:d error:nil];
+                LogLine(@"  目录 %@ 共 %lu 项：", d, (unsigned long)fs.count);
+                for (NSString *f in fs) {
+                    if ([f.lowercaseString containsString:@"km"] ||
+                        [f.lowercaseString containsString:@"code"] ||
+                        [f.lowercaseString hasSuffix:@".txt"])
+                        LogLine(@"      · %@", f);
+                }
+            }
             return;
         }
         LogLine(@"收据批量：清单来自 %@", lp);
@@ -1518,13 +1550,13 @@ static void InitDump(void) {
         (void)Dir();
         // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
         LogLine(@"############################################################");
-        LogLine(@"##########  DumpKeiem v26  BUILD-C5  2026-10-16  ###########");
+        LogLine(@"##########  DumpKeiem v27  BUILD-C6  2026-10-16  ###########");
         LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
         LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
         // 额外写一份版本标记到稳定位置，方便确认
         @try {
-            NSString *tag = @"DumpKeiem v26 BUILD-C5\n";
+            NSString *tag = @"DumpKeiem v27 BUILD-C6\n";
             for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
                                   [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
                 [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
