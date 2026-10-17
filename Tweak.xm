@@ -863,8 +863,8 @@ static void RunReceipts(void) {
                 else { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
                 if (n % 5 == 0)
                     LogLine(@"收据进度 %d  当前 %@  累计密钥 %d", n, code, gKeysFound);
-                // ★ 每 25 个一批，批末等 1 秒 —— 把 90 分钟压到约 4 分钟
-                if (n % 25 == 0) [NSThread sleepForTimeInterval:1.0];
+                // ★ 降速：每个请求后等 0.5 秒（每秒 2 个），避免冲崩插件 socket
+                [NSThread sleepForTimeInterval:0.5];
             } @catch (NSException *e) { LogLine(@"收据异常 %@ : %@", code, e); }
             if (n >= limit) { LogLine(@"本轮达上限 %d，下轮继续", limit); break; }
         }
@@ -1026,7 +1026,7 @@ static int InstallLoader(void) {
                 SEL cs = sd;
                 IMP dr = imp_implementationWithBlock(^void(id me, id sock, id err) {
                     @autoreleasepool {
-                        if (me && !gCfg) {
+                        if (me && !gCfg && [me respondsToSelector:@selector(fetchAndSaveReceiptForTheme:)]) {
                             gCfg = me;
                             LogLine(@"socket 回调捕获插件对象 %@", NSStringFromClass([me class]));
                         }
@@ -1550,13 +1550,13 @@ static void InitDump(void) {
         (void)Dir();
         // ★ 唯一构建标记 —— 一眼确认到底加载的是哪个版本
         LogLine(@"############################################################");
-        LogLine(@"##########  DumpKeiem v27  BUILD-C6  2026-10-16  ###########");
+        LogLine(@"##########  DumpKeiem v28  BUILD-C7  2026-10-16  ###########");
         LogLine(@"##########  信封/签名/收据/设备身份 全量采集  ###############");
         LogLine(@"############################################################");
         LogLine(@"输出目录 %@", Dir());
         // 额外写一份版本标记到稳定位置，方便确认
         @try {
-            NSString *tag = @"DumpKeiem v27 BUILD-C6\n";
+            NSString *tag = @"DumpKeiem v28 BUILD-C7\n";
             for (NSString *p in @[@"/var/mobile/Media/keiem_version.txt",
                                   [Dir() stringByAppendingPathComponent:@"VERSION.txt"]])
                 [tag writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
